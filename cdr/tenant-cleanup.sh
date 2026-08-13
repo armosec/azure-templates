@@ -47,14 +47,21 @@ ALLOW_NO_SUBS=false
 DRY_RUN=false
 ASSUME_YES=false
 
+# Fail with a clear usage error (exit 2) when a valued option has no argument — e.g. it was the last
+# token on the command line. Without this guard, `MG="$2"` under `set -u` aborts with a cryptic
+# "unbound variable" instead. $1 = option name, $2 = remaining arg count ($# at the call site).
+need_val() {
+  [[ "$2" -ge 2 ]] || { echo "error: option '$1' requires a value" >&2; exit 2; }
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --management-group) MG="$2"; shift 2 ;;
-    --security-subscription) SECURITY_SUB="$2"; shift 2 ;;
-    --resource-group) RESOURCE_GROUP="$2"; shift 2 ;;
-    --eventhub-namespace) EVENTHUB_NAMESPACE="$2"; shift 2 ;;
-    --diagnostic-setting-name) DIAG_NAME="$2"; shift 2 ;;
-    --policy-name) POLICY_NAME="$2"; shift 2 ;;
+    --management-group) need_val "$1" "$#"; MG="$2"; shift 2 ;;
+    --security-subscription) need_val "$1" "$#"; SECURITY_SUB="$2"; shift 2 ;;
+    --resource-group) need_val "$1" "$#"; RESOURCE_GROUP="$2"; shift 2 ;;
+    --eventhub-namespace) need_val "$1" "$#"; EVENTHUB_NAMESPACE="$2"; shift 2 ;;
+    --diagnostic-setting-name) need_val "$1" "$#"; DIAG_NAME="$2"; shift 2 ;;
+    --policy-name) need_val "$1" "$#"; POLICY_NAME="$2"; shift 2 ;;
     --allow-no-subscriptions) ALLOW_NO_SUBS=true; shift ;;
     --delete-central-stack) DELETE_CENTRAL_STACK=true; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
@@ -88,8 +95,9 @@ FAILURES=0
 
 # run: echo a command, then run it unless --dry-run. An already-gone resource is tolerated (so a
 # re-run after partial teardown is safe), but any other failure (permissions, throttling, bad args)
-# is surfaced with its output and counted — the script exits non-zero at the end if any occurred,
-# so a masked error can't make an incomplete teardown look successful.
+# is surfaced with its output, counted in FAILURES, AND returned as a non-zero status. A bare
+# `run <cmd>` therefore aborts the script under `set -e` (fail closed); steps that must keep sweeping
+# every item despite one failure use `run <cmd> || true`, which still counts it for the final exit code.
 run() {
   echo "+ $*"
   [[ "$DRY_RUN" == "true" ]] && return 0
@@ -108,6 +116,11 @@ run() {
   echo "  WARNING: command failed (rc=${rc}):" >&2
   echo "${out}" >&2
   FAILURES=$((FAILURES + 1))
+  # Return the failure so a bare `run <cmd>` fails closed under `set -e`. Without this, an assignment
+  # is run()'s last statement and it returns 0, hiding the failure from the caller — e.g. a failed
+  # remediation-cancel would let the script go on to delete the policy while a live remediation keeps
+  # recreating the diagnostic settings this teardown is removing.
+  return "$rc"
 }
 
 if [[ "$ASSUME_YES" == "false" && "$DRY_RUN" == "false" ]]; then
@@ -189,6 +202,9 @@ fi
 #    remediation task FIRST: deleting the assignment doesn't synchronously stop an in-flight
 #    remediation, so a running task's deployments could recreate settings after the step-3 sweep.
 #    Then delete the remediation task (orphaned otherwise), the assignment, and the definition.
+# These run() calls are intentionally NOT `|| true`: if the remediation can't be stopped, run()
+# returns non-zero and `set -e` aborts here, before the policy is deleted — leaving the policy in
+# place (safe, re-runnable) rather than removing it while a live remediation recreates settings.
 echo "== Cancelling and deleting the remediation task =="
 run az policy remediation cancel --name "$REMEDIATION_NAME" --management-group "$MG"
 run az policy remediation delete --name "$REMEDIATION_NAME" --management-group "$MG"
@@ -204,8 +220,10 @@ echo "== Deleting diagnostic settings across in-scope subscriptions =="
 # ever needs to be faster on a very large tenant, use a bounded pool (e.g. xargs -P 8) rather than
 # unbounded '&' background jobs — those would hit ARM rate limits and lose per-subscription errors.
 for sub in $SUB_IDS; do
+  # || true: one subscription's failure must not strand the rest still streaming to a dead hub (and
+  # a re-run would keep aborting on the same sub). run() has already counted it for the final exit.
   run az monitor diagnostic-settings subscription delete \
-    --name "$DIAG_NAME" --subscription "$sub" --yes
+    --name "$DIAG_NAME" --subscription "$sub" --yes || true
 done
 
 # main.bicep also puts a subscription-level diagnostic setting on the security subscription itself
@@ -214,14 +232,15 @@ done
 # management group. Delete it explicitly so it can't be orphaned pointing at a torn-down hub —
 # tolerated no-op if the sweep already handled it or the security sub was onboarded by policy only.
 run az monitor diagnostic-settings subscription delete \
-  --name "$DIAG_NAME" --subscription "$SECURITY_SUB" --yes
+  --name "$DIAG_NAME" --subscription "$SECURITY_SUB" --yes || true
 
 # 4. Delete the remediation identity's role assignments, by ID (captured in step 1).
 echo "== Removing remediation-identity role assignments =="
 if [[ -n "${ROLE_ASSIGNMENT_IDS//[[:space:]]/}" ]]; then
   while read -r ra_id; do
     [[ -n "$ra_id" ]] || continue
-    run az role assignment delete --ids "$ra_id"
+    # || true: keep removing the remaining assignments even if one delete fails (counted by run()).
+    run az role assignment delete --ids "$ra_id" || true
   done <<<"$ROLE_ASSIGNMENT_IDS"
 elif [[ -n "$PRINCIPAL_ID" ]]; then
   echo "  none found for the remediation identity — already removed"
@@ -232,7 +251,8 @@ fi
 # 5. Optionally delete the central collector stack (its resource group).
 if [[ "$DELETE_CENTRAL_STACK" == "true" ]]; then
   echo "== Deleting the central collector stack (resource group '${RESOURCE_GROUP}') =="
-  run az group delete --name "$RESOURCE_GROUP" --subscription "$SECURITY_SUB" --yes
+  # || true: let the run reach the final summary/exit-code path even if this last delete fails.
+  run az group delete --name "$RESOURCE_GROUP" --subscription "$SECURITY_SUB" --yes || true
 else
   echo "== Leaving the central collector stack in place (pass --delete-central-stack to remove it) =="
 fi
