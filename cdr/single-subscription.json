@@ -1,0 +1,550 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2018-05-01/subscriptionDeploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.45.15.27210",
+      "templateHash": "17425525140121780501"
+    }
+  },
+  "parameters": {
+    "customerGUID": {
+      "type": "string",
+      "metadata": {
+        "description": "ARMO customer/tenant identifier."
+      }
+    },
+    "subscriptionID": {
+      "type": "string",
+      "defaultValue": "[subscription().subscriptionId]",
+      "metadata": {
+        "description": "The onboarded subscription ID, threaded to the collector as AZURE_SUBSCRIPTION_ID so its liveness heartbeat can carry the account identity on a quiet subscription (SUB-7934). The backend passes the stored value; defaults to this deployment's subscription for manual/fallback deploys."
+      }
+    },
+    "tenantID": {
+      "type": "string",
+      "defaultValue": "[subscription().tenantId]",
+      "metadata": {
+        "description": "The onboarded tenant ID, threaded to the collector as AZURE_TENANT_ID. Carried as data on every batch so the ingester routes keep-alive by connection level, not by tenant presence (SUB-7934). Defaults to this deployment's tenant for manual/fallback deploys."
+      }
+    },
+    "connectionLevel": {
+      "type": "string",
+      "defaultValue": "account",
+      "metadata": {
+        "description": "Connection level (account | organization), threaded to the collector as CONNECTION_LEVEL. Drives keep-alive routing: account keys on the subscription, organization on the tenant. Single-subscription onboarding is account-level."
+      }
+    },
+    "heartbeatInterval": {
+      "type": "string",
+      "defaultValue": "5m",
+      "metadata": {
+        "description": "Liveness heartbeat cadence (Go duration, e.g. 5m), threaded to the collector as HEARTBEAT_INTERVAL. Must stay comfortably below the disconnect-staleness threshold. Tunable per-onboarding."
+      }
+    },
+    "accessKey": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Per-tenant API key for alert submission and rule download. Opaque; stored only as a Container App secret."
+      }
+    },
+    "alertExportUrl": {
+      "type": "string",
+      "defaultValue": "https://report.armo.cloud/cloud/v1/cdrAlert",
+      "metadata": {
+        "description": "ARMO endpoint that receives matched CDR alerts."
+      }
+    },
+    "ruleEndpointUrl": {
+      "type": "string",
+      "metadata": {
+        "description": "ARMO managed rule-delivery endpoint the collector downloads its rule set from."
+      }
+    },
+    "collectorImageRef": {
+      "type": "string",
+      "metadata": {
+        "description": "Public collector container image reference (Quay)."
+      }
+    },
+    "logLevel": {
+      "type": "string",
+      "defaultValue": "info",
+      "metadata": {
+        "description": "Collector log level (e.g. info, debug). Lets an operator raise verbosity without republishing the image."
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[deployment().location]",
+      "metadata": {
+        "description": "Azure region for the deployed resources."
+      }
+    },
+    "resourceGroupName": {
+      "type": "string",
+      "defaultValue": "armo-cdr",
+      "metadata": {
+        "description": "Resource group created to hold the collector stack."
+      }
+    },
+    "eventHubName": {
+      "type": "string",
+      "defaultValue": "insights-activity-logs",
+      "metadata": {
+        "description": "Event hub that receives the Activity Log."
+      }
+    },
+    "diagnosticSettingName": {
+      "type": "string",
+      "defaultValue": "armo-cdr-activity",
+      "metadata": {
+        "description": "Name of the subscription Activity Log diagnostic setting."
+      }
+    },
+    "eventHubNamespace": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Event Hub namespace name. Optional: when the backend onboarding flow supplies a pre-generated globally-unique name it is used verbatim; when empty (manual/fallback deploys) the module derives one deterministically from the resource group."
+      }
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Resources/resourceGroups",
+      "apiVersion": "2024-03-01",
+      "name": "[parameters('resourceGroupName')]",
+      "location": "[parameters('location')]"
+    },
+    {
+      "type": "Microsoft.Insights/diagnosticSettings",
+      "apiVersion": "2021-05-01-preview",
+      "name": "[parameters('diagnosticSettingName')]",
+      "properties": {
+        "eventHubAuthorizationRuleId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'armo-cdr-stack'), '2025-04-01').outputs.eventHubAuthRuleId.value]",
+        "eventHubName": "[parameters('eventHubName')]",
+        "logs": [
+          {
+            "category": "Administrative",
+            "enabled": true
+          },
+          {
+            "category": "Security",
+            "enabled": true
+          },
+          {
+            "category": "Policy",
+            "enabled": true
+          }
+        ]
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'armo-cdr-stack')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "armo-cdr-stack",
+      "resourceGroup": "[parameters('resourceGroupName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "eventHubName": {
+            "value": "[parameters('eventHubName')]"
+          },
+          "eventHubNamespace": {
+            "value": "[parameters('eventHubNamespace')]"
+          },
+          "customerGUID": {
+            "value": "[parameters('customerGUID')]"
+          },
+          "subscriptionID": {
+            "value": "[parameters('subscriptionID')]"
+          },
+          "tenantID": {
+            "value": "[parameters('tenantID')]"
+          },
+          "connectionLevel": {
+            "value": "[parameters('connectionLevel')]"
+          },
+          "heartbeatInterval": {
+            "value": "[parameters('heartbeatInterval')]"
+          },
+          "accessKey": {
+            "value": "[parameters('accessKey')]"
+          },
+          "alertExportUrl": {
+            "value": "[parameters('alertExportUrl')]"
+          },
+          "ruleEndpointUrl": {
+            "value": "[parameters('ruleEndpointUrl')]"
+          },
+          "collectorImageRef": {
+            "value": "[parameters('collectorImageRef')]"
+          },
+          "logLevel": {
+            "value": "[parameters('logLevel')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.45.15.27210",
+              "templateHash": "9640250131684944181"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string",
+              "metadata": {
+                "description": "Azure region."
+              }
+            },
+            "eventHubName": {
+              "type": "string",
+              "metadata": {
+                "description": "Event hub that receives the Activity Log."
+              }
+            },
+            "customerGUID": {
+              "type": "string",
+              "metadata": {
+                "description": "ARMO customer/tenant identifier."
+              }
+            },
+            "subscriptionID": {
+              "type": "string",
+              "metadata": {
+                "description": "The onboarded subscription ID, exposed to the collector as AZURE_SUBSCRIPTION_ID for the liveness heartbeat identity (SUB-7934)."
+              }
+            },
+            "tenantID": {
+              "type": "string",
+              "metadata": {
+                "description": "The onboarded tenant ID, exposed to the collector as AZURE_TENANT_ID (carried as data; drives no routing on its own)."
+              }
+            },
+            "connectionLevel": {
+              "type": "string",
+              "metadata": {
+                "description": "Connection level (account | organization), exposed to the collector as CONNECTION_LEVEL to drive keep-alive routing."
+              }
+            },
+            "heartbeatInterval": {
+              "type": "string",
+              "metadata": {
+                "description": "Liveness heartbeat cadence (Go duration), exposed to the collector as HEARTBEAT_INTERVAL."
+              }
+            },
+            "accessKey": {
+              "type": "securestring",
+              "metadata": {
+                "description": "Per-tenant API key (opaque). Mounted only as a Container App secret."
+              }
+            },
+            "alertExportUrl": {
+              "type": "string",
+              "metadata": {
+                "description": "ARMO alert-export endpoint."
+              }
+            },
+            "ruleEndpointUrl": {
+              "type": "string",
+              "metadata": {
+                "description": "ARMO managed rule-delivery endpoint."
+              }
+            },
+            "collectorImageRef": {
+              "type": "string",
+              "metadata": {
+                "description": "Public collector container image reference."
+              }
+            },
+            "logLevel": {
+              "type": "string",
+              "defaultValue": "info",
+              "metadata": {
+                "description": "Collector log level (e.g. info, debug). Lets an operator raise verbosity without republishing the image."
+              }
+            },
+            "eventHubNamespace": {
+              "type": "string",
+              "defaultValue": "",
+              "metadata": {
+                "description": "Event Hub namespace name. When empty, one is derived deterministically per resource group; the backend onboarding flow supplies a pre-generated globally-unique name so the connection config is known before deploy."
+              }
+            }
+          },
+          "variables": {
+            "namespaceName": "[if(empty(parameters('eventHubNamespace')), format('armocdr{0}', uniqueString(resourceGroup().id)), parameters('eventHubNamespace'))]",
+            "checkpointContainerName": "eventhub-checkpoints",
+            "eventHubsDataReceiverRoleId": "a638d3c7-ab3a-418d-83e6-5f17a39d4fde",
+            "storageBlobDataContributorRoleId": "ba92f5b4-2d11-453d-a403-e96b0029c9fe"
+          },
+          "resources": [
+            {
+              "type": "Microsoft.EventHub/namespaces",
+              "apiVersion": "2024-01-01",
+              "name": "[variables('namespaceName')]",
+              "location": "[parameters('location')]",
+              "sku": {
+                "name": "Standard",
+                "tier": "Standard"
+              }
+            },
+            {
+              "type": "Microsoft.EventHub/namespaces/eventhubs",
+              "apiVersion": "2024-01-01",
+              "name": "[format('{0}/{1}', variables('namespaceName'), parameters('eventHubName'))]",
+              "properties": {
+                "partitionCount": 2,
+                "messageRetentionInDays": 7
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.EventHub/namespaces', variables('namespaceName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.EventHub/namespaces/authorizationRules",
+              "apiVersion": "2024-01-01",
+              "name": "[format('{0}/{1}', variables('namespaceName'), 'armo-cdr-diagnostics-send')]",
+              "properties": {
+                "rights": [
+                  "Send"
+                ]
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.EventHub/namespaces', variables('namespaceName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Storage/storageAccounts",
+              "apiVersion": "2023-05-01",
+              "name": "[format('armocdr{0}', uniqueString(resourceGroup().id))]",
+              "location": "[parameters('location')]",
+              "sku": {
+                "name": "Standard_LRS"
+              },
+              "kind": "StorageV2",
+              "properties": {
+                "allowSharedKeyAccess": false,
+                "minimumTlsVersion": "TLS1_2"
+              }
+            },
+            {
+              "type": "Microsoft.Storage/storageAccounts/blobServices",
+              "apiVersion": "2023-05-01",
+              "name": "[format('{0}/{1}', format('armocdr{0}', uniqueString(resourceGroup().id)), 'default')]",
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts', format('armocdr{0}', uniqueString(resourceGroup().id)))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+              "apiVersion": "2023-05-01",
+              "name": "[format('{0}/{1}/{2}', format('armocdr{0}', uniqueString(resourceGroup().id)), 'default', variables('checkpointContainerName'))]",
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts/blobServices', format('armocdr{0}', uniqueString(resourceGroup().id)), 'default')]"
+              ]
+            },
+            {
+              "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+              "apiVersion": "2023-01-31",
+              "name": "armo-cdr-collector",
+              "location": "[parameters('location')]"
+            },
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.EventHub/namespaces', variables('namespaceName'))]",
+              "name": "[guid(resourceId('Microsoft.EventHub/namespaces', variables('namespaceName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', 'armo-cdr-collector'), variables('eventHubsDataReceiverRoleId'))]",
+              "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('eventHubsDataReceiverRoleId'))]",
+                "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', 'armo-cdr-collector'), '2023-01-31').principalId]",
+                "principalType": "ServicePrincipal"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.EventHub/namespaces', variables('namespaceName'))]",
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', 'armo-cdr-collector')]"
+              ]
+            },
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[resourceId('Microsoft.Storage/storageAccounts', format('armocdr{0}', uniqueString(resourceGroup().id)))]",
+              "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', format('armocdr{0}', uniqueString(resourceGroup().id))), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', 'armo-cdr-collector'), variables('storageBlobDataContributorRoleId'))]",
+              "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('storageBlobDataContributorRoleId'))]",
+                "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', 'armo-cdr-collector'), '2023-01-31').principalId]",
+                "principalType": "ServicePrincipal"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts', format('armocdr{0}', uniqueString(resourceGroup().id)))]",
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', 'armo-cdr-collector')]"
+              ]
+            },
+            {
+              "type": "Microsoft.App/managedEnvironments",
+              "apiVersion": "2024-03-01",
+              "name": "armo-cdr-env",
+              "location": "[parameters('location')]",
+              "properties": {}
+            },
+            {
+              "type": "Microsoft.App/containerApps",
+              "apiVersion": "2024-03-01",
+              "name": "armo-cdr-collector",
+              "location": "[parameters('location')]",
+              "identity": {
+                "type": "UserAssigned",
+                "userAssignedIdentities": {
+                  "[format('{0}', resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', 'armo-cdr-collector'))]": {}
+                }
+              },
+              "properties": {
+                "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', 'armo-cdr-env')]",
+                "configuration": {
+                  "activeRevisionsMode": "Single",
+                  "secrets": [
+                    {
+                      "name": "access-key",
+                      "value": "[parameters('accessKey')]"
+                    }
+                  ]
+                },
+                "template": {
+                  "containers": [
+                    {
+                      "name": "collector",
+                      "image": "[parameters('collectorImageRef')]",
+                      "resources": {
+                        "cpu": "[json('0.5')]",
+                        "memory": "1Gi"
+                      },
+                      "env": [
+                        {
+                          "name": "ARMO_CUSTOMER_GUID",
+                          "value": "[parameters('customerGUID')]"
+                        },
+                        {
+                          "name": "ARMO_ACCESS_KEY",
+                          "secretRef": "access-key"
+                        },
+                        {
+                          "name": "ARMO_ALERT_URL",
+                          "value": "[parameters('alertExportUrl')]"
+                        },
+                        {
+                          "name": "ARMO_RULE_ENDPOINT_URL",
+                          "value": "[parameters('ruleEndpointUrl')]"
+                        },
+                        {
+                          "name": "EVENTHUB_NAMESPACE",
+                          "value": "[format('{0}.servicebus.windows.net', variables('namespaceName'))]"
+                        },
+                        {
+                          "name": "EVENTHUB_NAME",
+                          "value": "[parameters('eventHubName')]"
+                        },
+                        {
+                          "name": "CHECKPOINT_STORAGE_ACCOUNT",
+                          "value": "[format('armocdr{0}', uniqueString(resourceGroup().id))]"
+                        },
+                        {
+                          "name": "CHECKPOINT_CONTAINER",
+                          "value": "[variables('checkpointContainerName')]"
+                        },
+                        {
+                          "name": "AZURE_CLIENT_ID",
+                          "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', 'armo-cdr-collector'), '2023-01-31').clientId]"
+                        },
+                        {
+                          "name": "AZURE_SUBSCRIPTION_ID",
+                          "value": "[parameters('subscriptionID')]"
+                        },
+                        {
+                          "name": "AZURE_TENANT_ID",
+                          "value": "[parameters('tenantID')]"
+                        },
+                        {
+                          "name": "CONNECTION_LEVEL",
+                          "value": "[parameters('connectionLevel')]"
+                        },
+                        {
+                          "name": "HEARTBEAT_INTERVAL",
+                          "value": "[parameters('heartbeatInterval')]"
+                        },
+                        {
+                          "name": "LOG_LEVEL",
+                          "value": "[parameters('logLevel')]"
+                        }
+                      ]
+                    }
+                  ],
+                  "scale": {
+                    "minReplicas": 1,
+                    "maxReplicas": 1
+                  }
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.App/managedEnvironments', 'armo-cdr-env')]",
+                "[extensionResourceId(resourceId('Microsoft.Storage/storageAccounts', format('armocdr{0}', uniqueString(resourceGroup().id))), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.Storage/storageAccounts', format('armocdr{0}', uniqueString(resourceGroup().id))), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', 'armo-cdr-collector'), variables('storageBlobDataContributorRoleId')))]",
+                "[extensionResourceId(resourceId('Microsoft.EventHub/namespaces', variables('namespaceName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.EventHub/namespaces', variables('namespaceName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', 'armo-cdr-collector'), variables('eventHubsDataReceiverRoleId')))]",
+                "[resourceId('Microsoft.Storage/storageAccounts', format('armocdr{0}', uniqueString(resourceGroup().id)))]",
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', 'armo-cdr-collector')]"
+              ]
+            }
+          ],
+          "outputs": {
+            "eventHubNamespaceFqdn": {
+              "type": "string",
+              "value": "[format('{0}.servicebus.windows.net', variables('namespaceName'))]"
+            },
+            "eventHubAuthRuleId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.EventHub/namespaces/authorizationRules', variables('namespaceName'), 'armo-cdr-diagnostics-send')]"
+            },
+            "collectorIdentityClientId": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', 'armo-cdr-collector'), '2023-01-31').clientId]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('resourceGroupName'))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "resourceGroup": {
+      "type": "string",
+      "value": "[parameters('resourceGroupName')]"
+    },
+    "eventHubNamespace": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'armo-cdr-stack'), '2025-04-01').outputs.eventHubNamespaceFqdn.value]"
+    },
+    "eventHubName": {
+      "type": "string",
+      "value": "[parameters('eventHubName')]"
+    },
+    "collectorIdentityClientId": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('resourceGroupName')), 'Microsoft.Resources/deployments', 'armo-cdr-stack'), '2025-04-01').outputs.collectorIdentityClientId.value]"
+    }
+  }
+}
