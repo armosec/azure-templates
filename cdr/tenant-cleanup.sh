@@ -33,6 +33,10 @@
 # --eventhub-namespace is required: without it the central Event Hub role assignment can't be
 # located, leaving an orphaned role assignment in the security subscription's IAM. Pass the bare
 # namespace name, not the FQDN that main.bicep outputs.
+#
+# --dry-run only stops the *deletions* (run() echoes instead of executing); the read-only resolution
+# steps (policy/identity/subscription lookups) still run, so --dry-run needs `az` access and can
+# still exit non-zero if those lookups fail (e.g. the management group can't be enumerated).
 set -euo pipefail
 
 MG=""
@@ -109,7 +113,10 @@ run() {
   # Tolerated no-op cases: "No matched assignments were found" is `az role assignment delete`'s
   # already-gone case; "not in a cancelable state" is `az policy remediation cancel` on a task that
   # has already completed (nothing to cancel — the delete that follows still cleans it up).
-  if grep -qiE "not found|could not be found|does not exist|ResourceNotFound|no longer exists|No matched assignments were found|not in a cancelable state" <<<"$out"; then
+  # NotFound also surfaces code-form with no space (ResourceGroupNotFound, ResourceNotFound, …), so
+  # match [A-Za-z]+NotFound in addition to the spaced phrases — otherwise a clean re-run whose error
+  # arrives as a code would be miscounted as a failure.
+  if grep -qiE "not found|could not be found|does not exist|[A-Za-z]+NotFound|no longer exists|No matched assignments were found|not in a cancelable state" <<<"$out"; then
     echo "  (already gone)"
     return 0
   fi
@@ -144,12 +151,15 @@ echo "principalId: ${PRINCIPAL_ID:-<none found>}"
 ROLE_ASSIGNMENT_IDS=""
 EMPTY_SCOPES=""
 if [[ -n "$PRINCIPAL_ID" ]]; then
+  # Capture stderr to a file, not 2>&1 into `ids`: on success az may print a warning on stderr, and
+  # folding it into `ids` would make step 4 try to delete a bogus `--ids <warning>` role assignment.
+  ra_err="$(mktemp)"
   for scope in "$MG_SCOPE" "$NS_SCOPE"; do
     if ! ids="$(az role assignment list --scope "$scope" --assignee-object-id "$PRINCIPAL_ID" \
                   --fill-principal-name false --fill-role-definition-name false \
-                  --query '[].id' -o tsv 2>&1)"; then
+                  --query '[].id' -o tsv 2>"$ra_err")"; then
       echo "  WARNING: could not list role assignments at ${scope}:" >&2
-      echo "${ids}" >&2
+      cat "$ra_err" >&2
       echo "  its role assignment (if any) will be left behind — check that scope's IAM by hand." >&2
       FAILURES=$((FAILURES + 1))
       continue
@@ -163,6 +173,7 @@ if [[ -n "$PRINCIPAL_ID" ]]; then
     fi
     ROLE_ASSIGNMENT_IDS+="${ids}"$'\n'
   done
+  rm -f "$ra_err"
   if [[ -n "$EMPTY_SCOPES" ]]; then
     # Warn but don't count this as a failure: it's expected on a re-run where the role assignments
     # were already deleted while the policy assignment (and thus its resolvable identity) remains —
@@ -231,6 +242,8 @@ done
 # removes it, and the sweep above only covers it if the security sub happens to sit under this
 # management group. Delete it explicitly so it can't be orphaned pointing at a torn-down hub —
 # tolerated no-op if the sweep already handled it or the security sub was onboarded by policy only.
+# Runs even without --delete-central-stack, on purpose: teardown always stops the log flow; that flag
+# only controls whether the collector's resource group is also removed (so a kept stack has no feed).
 run az monitor diagnostic-settings subscription delete \
   --name "$DIAG_NAME" --subscription "$SECURITY_SUB" --yes || true
 
@@ -245,7 +258,12 @@ if [[ -n "${ROLE_ASSIGNMENT_IDS//[[:space:]]/}" ]]; then
 elif [[ -n "$PRINCIPAL_ID" ]]; then
   echo "  none found for the remediation identity — already removed"
 else
-  echo "  policy assignment already gone, so no identity to clean up (expected on a re-run)"
+  # Expected on a clean re-run: the policy assignment (and thus its discoverable identity) is already
+  # gone. But if an EARLIER run failed while removing role assignments, they can't be discovered from
+  # here anymore — warn so the operator verifies rather than assuming a clean teardown.
+  echo "  policy assignment already gone, so the remediation identity can't be resolved here." >&2
+  echo "  If an earlier run reported errors removing role assignments, check the management group and" >&2
+  echo "  Event Hub namespace scopes for leftovers by hand (expected clean on a normal re-run)." >&2
 fi
 
 # 5. Optionally delete the central collector stack (its resource group).
