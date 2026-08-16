@@ -13,6 +13,12 @@ Consumers pin a **commit-specific** raw URL so a deployed command always points 
 
 ## Contents
 - `cdr/single-subscription.json` — single-subscription CDR collector (`azure/main.bicep`).
+  Subscription-scoped; also deployed **once** into the security subscription to create the central
+  collector for a whole-tenant onboarding.
+- `cdr/tenant-policy.json` — whole-tenant DINE policy (`azure/tenant-policy.bicep`).
+  Management-group-scoped (`az deployment mg create`); assigns the policy that routes every in-scope
+  subscription's Activity Log to the central Event Hub created above. It is the **second** half of a
+  tenant onboarding, not an alternative to the first.
 - `cdr/tenant-cleanup.sh` — whole-tenant teardown (`azure/tenant-cleanup.sh`): removes the DINE policy,
   remediation, the diagnostic settings it created across all in-scope subscriptions, and the collector's
   role assignments. Fetched by the tenant deletion flow.
