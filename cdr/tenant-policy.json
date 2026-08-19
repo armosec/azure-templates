@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.46.1.21595",
-      "templateHash": "5233528748114108969"
+      "templateHash": "14867904162621421822"
     }
   },
   "parameters": {
@@ -38,7 +38,7 @@
   },
   "variables": {
     "monitoringContributorRoleId": "749f88d5-cbae-40b8-bcfc-e573ddc772fa",
-    "policyName": "armo-cdr-activitylog-to-eventhub"
+    "policyName": "armo-cdr-activitylog"
   },
   "resources": [
     {
@@ -121,6 +121,9 @@
                     },
                     "diagnosticSettingName": {
                       "value": "[[parameters('diagnosticSettingName')]"
+                    },
+                    "deploymentLocation": {
+                      "value": "[[parameters('deploymentLocation')]"
                     }
                   },
                   "template": {
@@ -134,6 +137,9 @@
                         "type": "String"
                       },
                       "diagnosticSettingName": {
+                        "type": "String"
+                      },
+                      "deploymentLocation": {
                         "type": "String"
                       }
                     },
