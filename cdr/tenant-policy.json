@@ -1,0 +1,246 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-08-01/managementGroupDeploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.46.1.21595",
+      "templateHash": "14867904162621421822"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure region for the policy assignment's system-assigned identity and the remediation deployments."
+      }
+    },
+    "centralEventHubAuthorizationRuleId": {
+      "type": "string",
+      "metadata": {
+        "description": "Full resource ID of the central Event Hub Send authorization rule (armo-cdr-diagnostics-send) created by main.bicep in the security subscription. The deployed diagnostic settings authenticate to the hub with this SAS rule."
+      }
+    },
+    "centralEventHubName": {
+      "type": "string",
+      "defaultValue": "insights-activity-logs",
+      "metadata": {
+        "description": "Name of the central Event Hub that receives every subscription's Activity Log."
+      }
+    },
+    "diagnosticSettingName": {
+      "type": "string",
+      "defaultValue": "armo-cdr-activity",
+      "metadata": {
+        "description": "Name of the Activity-Log diagnostic setting created in each subscription. Matches the single-subscription template."
+      }
+    }
+  },
+  "variables": {
+    "monitoringContributorRoleId": "749f88d5-cbae-40b8-bcfc-e573ddc772fa",
+    "policyName": "armo-cdr-activitylog"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Authorization/policyDefinitions",
+      "apiVersion": "2023-04-01",
+      "name": "[variables('policyName')]",
+      "properties": {
+        "policyType": "Custom",
+        "mode": "All",
+        "displayName": "ARMO CDR — route subscription Activity Log to the central Event Hub",
+        "description": "Deploys the Activity-Log diagnostic setting on every subscription in scope, streaming Administrative/Security/Policy logs to the ARMO CDR central Event Hub in the security subscription.",
+        "metadata": {
+          "category": "Monitoring"
+        },
+        "parameters": {
+          "eventHubAuthorizationRuleId": {
+            "type": "String",
+            "metadata": {
+              "displayName": "Central Event Hub authorization rule ID",
+              "description": "Resource ID of the Send authorization rule on the central Event Hub namespace."
+            }
+          },
+          "eventHubName": {
+            "type": "String",
+            "defaultValue": "insights-activity-logs",
+            "metadata": {
+              "displayName": "Central Event Hub name"
+            }
+          },
+          "diagnosticSettingName": {
+            "type": "String",
+            "defaultValue": "armo-cdr-activity",
+            "metadata": {
+              "displayName": "Diagnostic setting name"
+            }
+          },
+          "deploymentLocation": {
+            "type": "String",
+            "metadata": {
+              "displayName": "Remediation deployment location"
+            }
+          }
+        },
+        "policyRule": {
+          "if": {
+            "field": "type",
+            "equals": "Microsoft.Resources/subscriptions"
+          },
+          "then": {
+            "effect": "deployIfNotExists",
+            "details": {
+              "type": "Microsoft.Insights/diagnosticSettings",
+              "deploymentScope": "Subscription",
+              "existenceScope": "Subscription",
+              "existenceCondition": {
+                "allOf": [
+                  {
+                    "field": "name",
+                    "equals": "[[parameters('diagnosticSettingName')]"
+                  },
+                  {
+                    "field": "Microsoft.Insights/diagnosticSettings/eventHubAuthorizationRuleId",
+                    "equals": "[[parameters('eventHubAuthorizationRuleId')]"
+                  }
+                ]
+              },
+              "roleDefinitionIds": [
+                "[format('/providers/Microsoft.Authorization/roleDefinitions/{0}', variables('monitoringContributorRoleId'))]"
+              ],
+              "deployment": {
+                "location": "[[parameters('deploymentLocation')]",
+                "properties": {
+                  "mode": "Incremental",
+                  "parameters": {
+                    "eventHubAuthorizationRuleId": {
+                      "value": "[[parameters('eventHubAuthorizationRuleId')]"
+                    },
+                    "eventHubName": {
+                      "value": "[[parameters('eventHubName')]"
+                    },
+                    "diagnosticSettingName": {
+                      "value": "[[parameters('diagnosticSettingName')]"
+                    },
+                    "deploymentLocation": {
+                      "value": "[[parameters('deploymentLocation')]"
+                    }
+                  },
+                  "template": {
+                    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/subscriptionDeploymentTemplate.json#",
+                    "contentVersion": "1.0.0.0",
+                    "parameters": {
+                      "eventHubAuthorizationRuleId": {
+                        "type": "String"
+                      },
+                      "eventHubName": {
+                        "type": "String"
+                      },
+                      "diagnosticSettingName": {
+                        "type": "String"
+                      },
+                      "deploymentLocation": {
+                        "type": "String"
+                      }
+                    },
+                    "resources": [
+                      {
+                        "type": "Microsoft.Insights/diagnosticSettings",
+                        "apiVersion": "2021-05-01-preview",
+                        "name": "[[parameters('diagnosticSettingName')]",
+                        "properties": {
+                          "eventHubAuthorizationRuleId": "[[parameters('eventHubAuthorizationRuleId')]",
+                          "eventHubName": "[[parameters('eventHubName')]",
+                          "logs": [
+                            {
+                              "category": "Administrative",
+                              "enabled": true
+                            },
+                            {
+                              "category": "Security",
+                              "enabled": true
+                            },
+                            {
+                              "category": "Policy",
+                              "enabled": true
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Authorization/policyAssignments",
+      "apiVersion": "2023-04-01",
+      "name": "[variables('policyName')]",
+      "location": "[parameters('location')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "properties": {
+        "displayName": "ARMO CDR — route subscription Activity Log to the central Event Hub",
+        "policyDefinitionId": "[extensionResourceId(managementGroup().id, 'Microsoft.Authorization/policyDefinitions', variables('policyName'))]",
+        "parameters": {
+          "eventHubAuthorizationRuleId": {
+            "value": "[parameters('centralEventHubAuthorizationRuleId')]"
+          },
+          "eventHubName": {
+            "value": "[parameters('centralEventHubName')]"
+          },
+          "diagnosticSettingName": {
+            "value": "[parameters('diagnosticSettingName')]"
+          },
+          "deploymentLocation": {
+            "value": "[parameters('location')]"
+          }
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(managementGroup().id, 'Microsoft.Authorization/policyDefinitions', variables('policyName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[guid(managementGroup().id, variables('policyName'), variables('monitoringContributorRoleId'))]",
+      "properties": {
+        "roleDefinitionId": "[tenantResourceId('Microsoft.Authorization/roleDefinitions', variables('monitoringContributorRoleId'))]",
+        "principalId": "[reference(extensionResourceId(managementGroup().id, 'Microsoft.Authorization/policyAssignments', variables('policyName')), '2023-04-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[extensionResourceId(managementGroup().id, 'Microsoft.Authorization/policyAssignments', variables('policyName'))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "policyAssignmentPrincipalId": {
+      "type": "string",
+      "metadata": {
+        "description": "Principal ID of the policy assignment's system-assigned identity. Grant it listKeys on the central Event Hub namespace (security subscription) and pass it to `az policy remediation create`."
+      },
+      "value": "[reference(extensionResourceId(managementGroup().id, 'Microsoft.Authorization/policyAssignments', variables('policyName')), '2023-04-01', 'full').identity.principalId]"
+    },
+    "policyAssignmentId": {
+      "type": "string",
+      "metadata": {
+        "description": "Resource ID of the policy assignment (for remediation and teardown)."
+      },
+      "value": "[extensionResourceId(managementGroup().id, 'Microsoft.Authorization/policyAssignments', variables('policyName'))]"
+    },
+    "policyDefinitionId": {
+      "type": "string",
+      "metadata": {
+        "description": "Resource ID of the policy definition."
+      },
+      "value": "[extensionResourceId(managementGroup().id, 'Microsoft.Authorization/policyDefinitions', variables('policyName'))]"
+    }
+  }
+}
