@@ -110,14 +110,23 @@ run() {
   if [[ $rc -eq 0 ]]; then
     return 0
   fi
-  # Tolerated no-op cases: "No matched assignments were found" is `az role assignment delete`'s
-  # already-gone case; a cancel on a task that has already completed or failed returns
-  # "A completed remediation cannot be cancelled" with code InvalidCancelRemediationRequest — there is
-  # nothing to cancel (a terminal remediation cannot recreate diagnostic settings), and the delete
-  # that follows still removes the record, so this must not abort the teardown.
-  # NotFound also surfaces code-form with no space (ResourceGroupNotFound, ResourceNotFound, …), so
-  # match [A-Za-z]+NotFound in addition to the spaced phrases — otherwise a clean re-run whose error
-  # arrives as a code would be miscounted as a failure.
+  # Tolerated no-op cases, in two kinds reported distinctly so teardown logs stay honest.
+  #
+  # (1) Still running, not deletable yet: `az policy remediation delete` on a remediation that has not
+  # reached a terminal state returns "must be in a terminal provisioning state"
+  # (InvalidDeleteRemediationRequest). The preceding cancel has already stopped it recreating settings,
+  # and its record — orphaned once the assignment is gone — is harmless and cleared on a subsequent run
+  # once terminal. It is NOT "gone", so it gets its own message.
+  if grep -qiE "terminal provisioning state|InvalidDeleteRemediationRequest" <<<"$out"; then
+    echo "  (still running — not deletable yet; left for a later run)"
+    return 0
+  fi
+  #
+  # (2) Already gone: "No matched assignments were found" is `az role assignment delete`'s already-gone
+  # case; a cancel on an already-terminal task returns "A completed remediation cannot be cancelled"
+  # (InvalidCancelRemediationRequest) — nothing to cancel. NotFound also surfaces code-form with no space
+  # (ResourceGroupNotFound, ResourceNotFound, …), so match [A-Za-z]+NotFound in addition to the spaced
+  # phrases — otherwise a clean re-run whose error arrives as a code would be miscounted as a failure.
   if grep -qiE "not found|could not be found|does not exist|[A-Za-z]+NotFound|no longer exists|No matched assignments were found|cannot be cancelled|InvalidCancelRemediationRequest" <<<"$out"; then
     echo "  (already gone)"
     return 0
@@ -212,15 +221,35 @@ else
 fi
 
 # 2. Stop anything that could recreate the diagnostic settings, then remove the policy. Cancel the
-#    remediation task FIRST: deleting the assignment doesn't synchronously stop an in-flight
+#    remediation tasks FIRST: deleting the assignment doesn't synchronously stop an in-flight
 #    remediation, so a running task's deployments could recreate settings after the step-3 sweep.
-#    Then delete the remediation task (orphaned otherwise), the assignment, and the definition.
-# These run() calls are intentionally NOT `|| true`: if the remediation can't be stopped, run()
-# returns non-zero and `set -e` aborts here, before the policy is deleted — leaving the policy in
-# place (safe, re-runnable) rather than removing it while a live remediation recreates settings.
-echo "== Cancelling and deleting the remediation task =="
-run az policy remediation cancel --name "$REMEDIATION_NAME" --management-group "$MG"
-run az policy remediation delete --name "$REMEDIATION_NAME" --management-group "$MG"
+# The onboarding script creates one remediation PER SUBSCRIPTION (at subscription scope); an
+# older/alternate run may instead have a management-group-scoped one, so clear that too.
+#
+# Cancel is best-effort ACROSS subscriptions (one sub's failure must not strand the rest) but fail-closed
+# in AGGREGATE: if any cancel fails for a real reason — permissions/throttling, NOT the tolerated
+# already-terminal / already-gone no-ops that run() returns 0 for — abort BEFORE deleting the policy, so
+# the assignment is never removed while a remediation we couldn't stop keeps recreating settings.
+echo "== Cancelling the remediation task(s) =="
+cancel_failed=""
+run az policy remediation cancel --name "$REMEDIATION_NAME" --management-group "$MG" || cancel_failed="$cancel_failed mg"
+for sub in $SUB_IDS; do
+  run az policy remediation cancel --name "$REMEDIATION_NAME" --subscription "$sub" || cancel_failed="$cancel_failed $sub"
+done
+if [[ -n "${cancel_failed// /}" ]]; then
+  echo "error: could not cancel the remediation on:$cancel_failed — not deleting the policy while a" >&2
+  echo "remediation may still be live (it could recreate diagnostic settings after the sweep). Resolve" >&2
+  echo "the access/throttling issue and re-run; teardown is idempotent." >&2
+  exit 1
+fi
+
+# Delete the (now-cancelled) remediation records. Best-effort: a still-running one ("not deletable yet")
+# is a tolerated no-op in run() — the cancel above already stopped it, and a later run clears the record.
+echo "== Deleting the remediation task(s) =="
+run az policy remediation delete --name "$REMEDIATION_NAME" --management-group "$MG" || true
+for sub in $SUB_IDS; do
+  run az policy remediation delete --name "$REMEDIATION_NAME" --subscription "$sub" || true
+done
 
 echo "== Deleting the policy assignment and definition =="
 run az policy assignment delete --name "$POLICY_NAME" --scope "$MG_SCOPE"
