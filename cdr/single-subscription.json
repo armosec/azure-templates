@@ -4,8 +4,8 @@
   "metadata": {
     "_generator": {
       "name": "bicep",
-      "version": "0.45.15.27210",
-      "templateHash": "17425525140121780501"
+      "version": "0.46.1.21595",
+      "templateHash": "15410820700678270657"
     }
   },
   "parameters": {
@@ -201,8 +201,8 @@
           "metadata": {
             "_generator": {
               "name": "bicep",
-              "version": "0.45.15.27210",
-              "templateHash": "9640250131684944181"
+              "version": "0.46.1.21595",
+              "templateHash": "13354317514554037923"
             }
           },
           "parameters": {
@@ -309,7 +309,7 @@
               "apiVersion": "2024-01-01",
               "name": "[format('{0}/{1}', variables('namespaceName'), parameters('eventHubName'))]",
               "properties": {
-                "partitionCount": 2,
+                "partitionCount": 8,
                 "messageRetentionInDays": 7
               },
               "dependsOn": [
