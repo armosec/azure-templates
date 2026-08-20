@@ -20,6 +20,13 @@
 #      group; Event Hub listKeys in the security subscription) by resource ID.
 #   5. Optionally delete the central collector stack (its resource group) in the security
 #      subscription.
+# Also deletes the two ARM deployment RECORDS (the management-group `armo-cdr-tenant-policy` and, with
+# --delete-central-stack, the subscription-scoped `armo-cdr`): they hold no resources but reserve their
+# name against the region they were created in, which blocks a later reconnect in a different region.
+#
+# Deliberately NOT reverted: the per-subscription `microsoft.insights` / `Microsoft.PolicyInsights`
+# provider registrations. They are tenant state the customer may rely on elsewhere, and unregistering a
+# provider can fail outright when resources of that type still exist — leaving them registered is correct.
 #
 # It is idempotent: already-deleted resources are skipped, so a re-run after a partial failure is
 # safe. Run it signed in with `az`, with the same rights used to onboard (Owner / User Access
@@ -46,6 +53,8 @@ EVENTHUB_NAMESPACE=""
 DIAG_NAME="armo-cdr-activity"
 POLICY_NAME="armo-cdr-activitylog"
 REMEDIATION_NAME="armo-cdr-activitylog-remediation"
+TENANT_POLICY_DEPLOY_NAME="armo-cdr-tenant-policy" # `az deployment mg create` name (tenant-policy.bicep)
+CENTRAL_DEPLOY_NAME="armo-cdr"                      # `az deployment sub create` name (main.bicep)
 DELETE_CENTRAL_STACK=false
 ALLOW_NO_SUBS=false
 DRY_RUN=false
@@ -254,6 +263,11 @@ done
 echo "== Deleting the policy assignment and definition =="
 run az policy assignment delete --name "$POLICY_NAME" --scope "$MG_SCOPE"
 run az policy definition delete --name "$POLICY_NAME" --management-group "$MG"
+# Delete the management-group deployment RECORD from `az deployment mg create`. It holds no resources,
+# but ARM reserves the deployment name against the region it was created in, so leaving it blocks a
+# later reconnect in a different region (InvalidDeploymentLocation) — same reason the account teardown
+# deletes its subscription-scoped record. Unconditional: the policy is always torn down. Best-effort.
+run az deployment mg delete --management-group-id "$MG" --name "$TENANT_POLICY_DEPLOY_NAME" || true
 
 # 3. Delete the diagnostic setting from every subscription under the management group (recursively).
 #    Safe now that the policy is gone — nothing recreates them.
@@ -300,6 +314,11 @@ fi
 # 5. Optionally delete the central collector stack (its resource group).
 if [[ "$DELETE_CENTRAL_STACK" == "true" ]]; then
   echo "== Deleting the central collector stack (resource group '${RESOURCE_GROUP}') =="
+  # Delete the subscription-scoped deployment RECORD first (before the long group delete, so a dropped
+  # session can't skip it): it reserves the deployment name against its original region, blocking a
+  # reconnect in a different region. Behind --delete-central-stack because it is the record for the very
+  # stack that flag removes. Same reason + ordering as the account teardown.
+  run az deployment sub delete --subscription "$SECURITY_SUB" --name "$CENTRAL_DEPLOY_NAME" || true
   # || true: let the run reach the final summary/exit-code path even if this last delete fails.
   run az group delete --name "$RESOURCE_GROUP" --subscription "$SECURITY_SUB" --yes || true
 else
