@@ -319,7 +319,7 @@ if [[ "$DELETE_CENTRAL_STACK" == "true" ]]; then
   # reconnect in a different region. Behind --delete-central-stack because it is the record for the very
   # stack that flag removes. Same reason + ordering as the account teardown.
   run az deployment sub delete --subscription "$SECURITY_SUB" --name "$CENTRAL_DEPLOY_NAME" || true
-  # || true: let the run reach the final summary/exit-code path even if this last delete fails.
+  # || true: let the run reach the final summary/exit-code path even if the resource-group delete fails.
   run az group delete --name "$RESOURCE_GROUP" --subscription "$SECURITY_SUB" --yes || true
 else
   echo "== Leaving the central collector stack in place (pass --delete-central-stack to remove it) =="
