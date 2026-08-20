@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.46.1.21595",
-      "templateHash": "14867904162621421822"
+      "templateHash": "5078848563957638423"
     }
   },
   "parameters": {
@@ -74,12 +74,6 @@
             "metadata": {
               "displayName": "Diagnostic setting name"
             }
-          },
-          "deploymentLocation": {
-            "type": "String",
-            "metadata": {
-              "displayName": "Remediation deployment location"
-            }
           }
         },
         "policyRule": {
@@ -109,7 +103,7 @@
                 "[format('/providers/Microsoft.Authorization/roleDefinitions/{0}', variables('monitoringContributorRoleId'))]"
               ],
               "deployment": {
-                "location": "[[parameters('deploymentLocation')]",
+                "location": "[parameters('location')]",
                 "properties": {
                   "mode": "Incremental",
                   "parameters": {
@@ -121,9 +115,6 @@
                     },
                     "diagnosticSettingName": {
                       "value": "[[parameters('diagnosticSettingName')]"
-                    },
-                    "deploymentLocation": {
-                      "value": "[[parameters('deploymentLocation')]"
                     }
                   },
                   "template": {
@@ -137,9 +128,6 @@
                         "type": "String"
                       },
                       "diagnosticSettingName": {
-                        "type": "String"
-                      },
-                      "deploymentLocation": {
                         "type": "String"
                       }
                     },
@@ -196,9 +184,6 @@
           },
           "diagnosticSettingName": {
             "value": "[parameters('diagnosticSettingName')]"
-          },
-          "deploymentLocation": {
-            "value": "[parameters('location')]"
           }
         }
       },

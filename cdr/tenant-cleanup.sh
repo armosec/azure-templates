@@ -111,12 +111,14 @@ run() {
     return 0
   fi
   # Tolerated no-op cases: "No matched assignments were found" is `az role assignment delete`'s
-  # already-gone case; "not in a cancelable state" is `az policy remediation cancel` on a task that
-  # has already completed (nothing to cancel — the delete that follows still cleans it up).
+  # already-gone case; a cancel on a task that has already completed or failed returns
+  # "A completed remediation cannot be cancelled" with code InvalidCancelRemediationRequest — there is
+  # nothing to cancel (a terminal remediation cannot recreate diagnostic settings), and the delete
+  # that follows still removes the record, so this must not abort the teardown.
   # NotFound also surfaces code-form with no space (ResourceGroupNotFound, ResourceNotFound, …), so
   # match [A-Za-z]+NotFound in addition to the spaced phrases — otherwise a clean re-run whose error
   # arrives as a code would be miscounted as a failure.
-  if grep -qiE "not found|could not be found|does not exist|[A-Za-z]+NotFound|no longer exists|No matched assignments were found|not in a cancelable state" <<<"$out"; then
+  if grep -qiE "not found|could not be found|does not exist|[A-Za-z]+NotFound|no longer exists|No matched assignments were found|cannot be cancelled|InvalidCancelRemediationRequest" <<<"$out"; then
     echo "  (already gone)"
     return 0
   fi
