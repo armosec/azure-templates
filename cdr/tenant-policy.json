@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.46.1.21595",
-      "templateHash": "5078848563957638423"
+      "templateHash": "10192983077878326923"
     }
   },
   "parameters": {
@@ -190,26 +190,13 @@
       "dependsOn": [
         "[extensionResourceId(managementGroup().id, 'Microsoft.Authorization/policyDefinitions', variables('policyName'))]"
       ]
-    },
-    {
-      "type": "Microsoft.Authorization/roleAssignments",
-      "apiVersion": "2022-04-01",
-      "name": "[guid(managementGroup().id, variables('policyName'), variables('monitoringContributorRoleId'))]",
-      "properties": {
-        "roleDefinitionId": "[tenantResourceId('Microsoft.Authorization/roleDefinitions', variables('monitoringContributorRoleId'))]",
-        "principalId": "[reference(extensionResourceId(managementGroup().id, 'Microsoft.Authorization/policyAssignments', variables('policyName')), '2023-04-01', 'full').identity.principalId]",
-        "principalType": "ServicePrincipal"
-      },
-      "dependsOn": [
-        "[extensionResourceId(managementGroup().id, 'Microsoft.Authorization/policyAssignments', variables('policyName'))]"
-      ]
     }
   ],
   "outputs": {
     "policyAssignmentPrincipalId": {
       "type": "string",
       "metadata": {
-        "description": "Principal ID of the policy assignment's system-assigned identity. Grant it listKeys on the central Event Hub namespace (security subscription) and pass it to `az policy remediation create`."
+        "description": "Principal ID of the policy assignment's system-assigned identity. Grant it Monitoring Contributor at the management group and listKeys on the central Event Hub namespace (security subscription), then pass it to `az policy remediation create`."
       },
       "value": "[reference(extensionResourceId(managementGroup().id, 'Microsoft.Authorization/policyAssignments', variables('policyName')), '2023-04-01', 'full').identity.principalId]"
     },
