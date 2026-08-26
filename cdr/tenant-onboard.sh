@@ -30,6 +30,7 @@
 #                     --eventhub-namespace <NS> --tenant-policy-template-url <URL> \
 #                     [--resource-group armo-cdr] [--eventhub-name insights-activity-logs] \
 #                     [--policy-name armo-cdr-activitylog] \
+#                     [--diagnostic-setting-name armo-cdr-activity] \
 #                     [--dry-run] [--yes]
 set -euo pipefail
 
@@ -127,7 +128,7 @@ else
   PRINCIPAL="$(az deployment mg create --name "$TENANT_POLICY_DEPLOY_NAME" \
     --management-group-id "$MG" --location "$LOCATION" \
     --template-uri "$TENANT_POLICY_TEMPLATE_URL" \
-    --parameters location="$LOCATION" centralEventHubAuthorizationRuleId="$AUTH_RULE_ID" centralEventHubName="$EVENTHUB_NAME" \
+    --parameters location="$LOCATION" centralEventHubAuthorizationRuleId="$AUTH_RULE_ID" centralEventHubName="$EVENTHUB_NAME" diagnosticSettingName="$DIAG_SETTING_NAME" \
     --query properties.outputs.policyAssignmentPrincipalId.value -o tsv)"
 fi
 [[ -n "$PRINCIPAL" ]] || { echo "error: could not resolve the policy assignment's identity principal id" >&2; exit 1; }
