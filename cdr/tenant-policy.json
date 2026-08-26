@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.46.1.21595",
-      "templateHash": "10192983077878326923"
+      "templateHash": "10401633922038684848"
     }
   },
   "parameters": {
@@ -196,7 +196,7 @@
     "policyAssignmentPrincipalId": {
       "type": "string",
       "metadata": {
-        "description": "Principal ID of the policy assignment's system-assigned identity. Grant it Monitoring Contributor at the management group and listKeys on the central Event Hub namespace (security subscription), then pass it to `az policy remediation create`."
+        "description": "Principal ID of the policy assignment's system-assigned identity. Grant it Monitoring Contributor at the management group and Azure Event Hubs Data Owner on the central Event Hub namespace (security subscription), then pass it to `az policy remediation create`."
       },
       "value": "[reference(extensionResourceId(managementGroup().id, 'Microsoft.Authorization/policyAssignments', variables('policyName')), '2023-04-01', 'full').identity.principalId]"
     },

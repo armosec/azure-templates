@@ -85,6 +85,14 @@ if [[ "$EVENTHUB_NAMESPACE" == *.* ]]; then
   exit 2
 fi
 
+# The policy template is fetched by `az deployment mg create --template-uri`. This script is itself
+# downloaded and run, so refuse to fetch the template over anything but https — a plain-http (or other
+# scheme) template URL is an insecure fetch of code Azure then deploys tenant-wide.
+if [[ "$TENANT_POLICY_TEMPLATE_URL" != https://* ]]; then
+  echo "error: --tenant-policy-template-url must be an https:// URL (got '${TENANT_POLICY_TEMPLATE_URL}')." >&2
+  exit 2
+fi
+
 MG_SCOPE="/providers/Microsoft.Management/managementGroups/${MG}"
 NS_SCOPE="/subscriptions/${SECURITY_SUB}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.EventHub/namespaces/${EVENTHUB_NAMESPACE}"
 AUTH_RULE_ID="${NS_SCOPE}/authorizationRules/${SEND_RULE_NAME}"
@@ -169,7 +177,7 @@ run az role assignment create --assignee-object-id "$PRINCIPAL" --assignee-princ
 # were made, and the reads + sleeps would otherwise make dry-run neither offline nor quick).
 if [[ "$DRY_RUN" != "true" ]]; then
   echo "== Waiting for the role grants to propagate =="
-  for i in $(seq 1 20); do
+  for _ in $(seq 1 20); do
     mc="$(az role assignment list --scope "$MG_SCOPE" --assignee-object-id "$PRINCIPAL" --role "$MONITORING_CONTRIBUTOR_ROLE_ID" --query '[0].id' -o tsv 2>/dev/null || true)"
     eh="$(az role assignment list --scope "$NS_SCOPE" --assignee-object-id "$PRINCIPAL" --role "$EVENTHUB_DATA_OWNER_ROLE" --query '[0].id' -o tsv 2>/dev/null || true)"
     [[ -n "$mc" && -n "$eh" ]] && break
