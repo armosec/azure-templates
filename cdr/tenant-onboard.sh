@@ -30,6 +30,7 @@
 #                     --eventhub-namespace <NS> --tenant-policy-template-url <URL> \
 #                     [--resource-group armo-cdr] [--eventhub-name insights-activity-logs] \
 #                     [--policy-name armo-cdr-activitylog] \
+#                     [--diagnostic-setting-name armo-cdr-activity] \
 #                     [--dry-run] [--yes]
 set -euo pipefail
 
@@ -42,6 +43,7 @@ EVENTHUB_NAME="insights-activity-logs"
 TENANT_POLICY_TEMPLATE_URL=""
 POLICY_NAME="armo-cdr-activitylog"
 REMEDIATION_NAME="armo-cdr-activitylog-remediation"
+DIAG_SETTING_NAME="armo-cdr-activity" # the diagnostic setting the DINE policy deploys per subscription. MUST match tenant-policy.bicep's diagnosticSettingName (its default today) — the self-heal below identifies our remediation deployments by it. Overridable via --diagnostic-setting-name so it can be kept in lockstep if the backend ever passes a non-default (as it does for --policy-name).
 TENANT_POLICY_DEPLOY_NAME="armo-cdr-tenant-policy"
 SEND_RULE_NAME="armo-cdr-diagnostics-send"
 MONITORING_CONTRIBUTOR_ROLE_ID="749f88d5-cbae-40b8-bcfc-e573ddc772fa" # built-in; matches tenant-policy.bicep
@@ -63,6 +65,7 @@ while [[ $# -gt 0 ]]; do
     --eventhub-name) need_val "$1" "$#"; EVENTHUB_NAME="$2"; shift 2 ;;
     --tenant-policy-template-url) need_val "$1" "$#"; TENANT_POLICY_TEMPLATE_URL="$2"; shift 2 ;;
     --policy-name) need_val "$1" "$#"; POLICY_NAME="$2"; shift 2 ;;
+    --diagnostic-setting-name) need_val "$1" "$#"; DIAG_SETTING_NAME="$2"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
     --yes) ASSUME_YES=true; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -125,7 +128,7 @@ else
   PRINCIPAL="$(az deployment mg create --name "$TENANT_POLICY_DEPLOY_NAME" \
     --management-group-id "$MG" --location "$LOCATION" \
     --template-uri "$TENANT_POLICY_TEMPLATE_URL" \
-    --parameters location="$LOCATION" centralEventHubAuthorizationRuleId="$AUTH_RULE_ID" centralEventHubName="$EVENTHUB_NAME" \
+    --parameters location="$LOCATION" centralEventHubAuthorizationRuleId="$AUTH_RULE_ID" centralEventHubName="$EVENTHUB_NAME" diagnosticSettingName="$DIAG_SETTING_NAME" \
     --query properties.outputs.policyAssignmentPrincipalId.value -o tsv)"
 fi
 [[ -n "$PRINCIPAL" ]] || { echo "error: could not resolve the policy assignment's identity principal id" >&2; exit 1; }
@@ -206,13 +209,50 @@ fi
 echo "== Kicking off remediation across in-scope subscriptions =="
 failed=""
 for sub in $SUBS; do
+  # Self-heal a re-onboard. Azure Policy names each remediation deployment deterministically from the
+  # (fixed) policy name + subscription, so a previous onboarding of this tenant leaves a same-named
+  # PolicyDeployment_* record in the subscription's deployment history. Teardown removes the diagnostic
+  # setting and the assignment but NOT that history record, so on re-onboard the remediation's internal
+  # "Create Deployment" hits 409 Conflict and the subscription silently never re-wires. Delete our
+  # leftover record(s) first so the remediation can recreate the same-named deployment cleanly.
+  #
+  # One `az deployment sub list` per subscription (not a list + a show per record): DeploymentExtended
+  # carries properties.parameters, so we match on the diagnostic-setting name the deployment was CREATED
+  # with. That matches whether the prior remediation succeeded OR failed — a failed record has no
+  # outputResources but still carries the parameters it was submitted with, and its retained name 409s
+  # just the same — so this also heals the re-run-after-partial-failure case. Matching on our own
+  # parameter value never touches an unrelated policy's PolicyDeployment; deleting a history record
+  # affects no live resource.
+  #
+  # Fail CLOSED on a read we can't complete: an empty result (exit 0) means "no leftover records" and is
+  # fine, but a non-zero `list` (throttling / missing read access) means we can't prove the sub is clean,
+  # so we must not risk a silent 409 — flag it like a failed delete. Guarded from --dry-run (live reads).
+  heal_ok=true
+  if [[ "$DRY_RUN" != "true" ]]; then
+    if stale="$(az deployment sub list --subscription "$sub" \
+        --query "[?starts_with(name, 'PolicyDeployment_') && properties.parameters.diagnosticSettingName.value == '${DIAG_SETTING_NAME}'].name" \
+        -o tsv)"; then
+      for dep in $stale; do
+        run az deployment sub delete --subscription "$sub" --name "$dep" || heal_ok=false
+      done
+    else
+      heal_ok=false
+    fi
+  fi
+  # If a conflicting record couldn't be cleared (or even confirmed absent), remediation on this sub would
+  # risk a 409 and silently not re-wire — flag it via the summary warning and skip the doomed remediation,
+  # rather than let a partial fan-in look like success.
+  if [[ "$heal_ok" != "true" ]]; then
+    failed="$failed $sub"
+    continue
+  fi
   # Suppress only stdout (the success JSON); keep stderr so a per-subscription failure's az error is
   # visible next to the summary warning, not hidden.
   run az policy remediation create --name "$REMEDIATION_NAME" --subscription "$sub" \
     --policy-assignment "$ASSIGNMENT_ID" --resource-discovery-mode ReEvaluateCompliance >/dev/null \
     || failed="$failed $sub"
 done
-[[ -z "$failed" ]] || echo "WARNING: could not start remediation on:$failed (insufficient access?) — a re-run is safe." >&2
+[[ -z "$failed" ]] || echo "WARNING: onboarding may be incomplete on:$failed — could not clear a conflicting deployment or start remediation (insufficient access?). Re-running is safe." >&2
 
 echo ""
 echo "ARMO CDR: tenant onboarding submitted. Activity-Log fan-in completes asynchronously"
