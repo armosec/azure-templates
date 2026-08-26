@@ -178,7 +178,11 @@ run az role assignment create --assignee-object-id "$PRINCIPAL" --assignee-princ
 if [[ "$DRY_RUN" != "true" ]]; then
   echo "== Waiting for the role grants to propagate =="
   for _ in $(seq 1 20); do
-    mc="$(az role assignment list --scope "$MG_SCOPE" --assignee-object-id "$PRINCIPAL" --role "$MONITORING_CONTRIBUTOR_ROLE_ID" --query '[0].id' -o tsv 2>/dev/null || true)"
+    # `az role assignment list --role <GUID>` does NOT match at management-group scope (only the role
+    # NAME matches there), so this readback would never see the grant and the wait would always time out.
+    # Filter client-side on roleDefinitionId instead, keyed on the same built-in GUID the grant used. The
+    # Event Hub check is at resource scope and matches fine by role name.
+    mc="$(az role assignment list --scope "$MG_SCOPE" --assignee-object-id "$PRINCIPAL" --query "[?contains(roleDefinitionId, '$MONITORING_CONTRIBUTOR_ROLE_ID')].id | [0]" -o tsv 2>/dev/null || true)"
     eh="$(az role assignment list --scope "$NS_SCOPE" --assignee-object-id "$PRINCIPAL" --role "$EVENTHUB_DATA_OWNER_ROLE" --query '[0].id' -o tsv 2>/dev/null || true)"
     [[ -n "$mc" && -n "$eh" ]] && break
     sleep 15
