@@ -113,7 +113,9 @@ run() {
 }
 
 if [[ "$ASSUME_YES" == "false" && "$DRY_RUN" == "false" ]]; then
-  read -r -p "Assign the ARMO CDR fan-in policy at management group '${MG}' and wire its subscriptions? [y/N] " reply
+  # `|| reply=""`: without --yes on a non-interactive stdin (piped/CI), `read` hits EOF and returns
+  # non-zero, which under `set -e` would abort here instead of reaching the clean "aborted." path below.
+  read -r -p "Assign the ARMO CDR fan-in policy at management group '${MG}' and wire its subscriptions? [y/N] " reply || reply=""
   [[ "$reply" == "y" || "$reply" == "Y" ]] || { echo "aborted."; exit 0; }
 fi
 
@@ -163,16 +165,47 @@ done
 # Monitoring Contributor and every remediation failing PolicyAuthorizationFailed.
 #
 # `--assignee-object-id` + `--assignee-principal-type ServicePrincipal` skips the Graph lookup that
-# `--assignee` does, which lags for a just-created policy identity. `az role assignment create` is
-# idempotent on (principal, role, scope) — a re-run returns the existing assignment with exit 0 — so
-# these are safe to re-run. NOT guarded with `|| true`: a genuine failure here (e.g. the operator lacks
-# User Access Administrator) must abort with the clear AuthorizationFailed rather than press on into a
-# 5-minute silent wait and a vague "could not start remediation" further down.
+# `--assignee` does, which lags for a just-created policy identity. When the create runs it is
+# fail-closed (bare `run`, no `|| true`): a genuine failure (e.g. the operator lacks User Access
+# Administrator) must abort with the clear AuthorizationFailed rather than press on into a 5-minute
+# silent wait and a vague "could not start remediation" further down. Re-run safety is handled by the
+# check-then-create below, NOT by the create being idempotent: `az role assignment create` is NOT safe
+# to re-run on an existing management-group assignment (it crashes — see the block below).
 echo "== Granting the remediation identity its roles =="
-run az role assignment create --assignee-object-id "$PRINCIPAL" --assignee-principal-type ServicePrincipal \
-  --role "$MONITORING_CONTRIBUTOR_ROLE_ID" --scope "$MG_SCOPE"
-run az role assignment create --assignee-object-id "$PRINCIPAL" --assignee-principal-type ServicePrincipal \
-  --role "$EVENTHUB_DATA_OWNER_ROLE" --scope "$NS_SCOPE"
+# Idempotent grants. A re-onboard reuses the same policy-assignment identity (the assignment name is
+# fixed, so `az deployment mg create` keeps its system-assigned principal), which means its grants may
+# already exist. `az role assignment create` is NOT safe to re-run on an existing MG-scoped assignment:
+# on RoleAssignmentExists the CLI tries to return the existing one via a role-id lookup that yields
+# nothing at management-group scope (the same quirk as the readback below) and crashes with
+# "IndexError: list index out of range" instead of a clean no-op. So create each grant only when it's
+# absent, keyed on the role it grants. (--dry-run: skip the reads — the principal is a placeholder —
+# and just show the creates.)
+mc_present=""; eh_present=""
+if [[ "$DRY_RUN" != "true" ]]; then
+  # Fail CLOSED on a read we can't complete. An empty result (exit 0) means the grant is absent and we
+  # create it below; but a NON-ZERO list (throttling / missing read access) must NOT be read as "absent"
+  # — that would attempt a create on an assignment that may already exist and crash with the same
+  # IndexError described above. Distinguish the two by the list's exit status (not `2>/dev/null || true`,
+  # which conflates them) and abort with a clear, re-runnable error.
+  mc_present="$(az role assignment list --scope "$MG_SCOPE" --assignee-object-id "$PRINCIPAL" \
+    --query "[?contains(roleDefinitionId, '$MONITORING_CONTRIBUTOR_ROLE_ID')].id | [0]" -o tsv)" || {
+    echo "error: could not read role assignments at the management group (throttling / access?) — re-run." >&2; exit 1; }
+  eh_present="$(az role assignment list --scope "$NS_SCOPE" --assignee-object-id "$PRINCIPAL" \
+    --role "$EVENTHUB_DATA_OWNER_ROLE" --query '[0].id' -o tsv)" || {
+    echo "error: could not read role assignments on the Event Hub namespace (throttling / access?) — re-run." >&2; exit 1; }
+fi
+if [[ -n "$mc_present" ]]; then
+  echo "  Monitoring Contributor already granted at the management group — skipping"
+else
+  run az role assignment create --assignee-object-id "$PRINCIPAL" --assignee-principal-type ServicePrincipal \
+    --role "$MONITORING_CONTRIBUTOR_ROLE_ID" --scope "$MG_SCOPE"
+fi
+if [[ -n "$eh_present" ]]; then
+  echo "  Azure Event Hubs Data Owner already granted on the namespace — skipping"
+else
+  run az role assignment create --assignee-object-id "$PRINCIPAL" --assignee-principal-type ServicePrincipal \
+    --role "$EVENTHUB_DATA_OWNER_ROLE" --scope "$NS_SCOPE"
+fi
 
 # 4b. Wait until BOTH grants are READABLE before remediating — each remediation deployment exercises
 # them asynchronously, and RBAC propagation lags creation. Both checks are filtered by role so an
@@ -196,7 +229,8 @@ if [[ "$DRY_RUN" != "true" ]]; then
   [[ -n "$mc" && -n "$eh" ]] || {
     echo "error: the remediation identity's role grants (Monitoring Contributor at the management group," >&2
     echo "       Event Hubs Data Owner on the central namespace) did not become readable within the timeout." >&2
-    echo "       Per-subscription remediation would fail. Verify you have User Access Administrator, then re-run." >&2
+    echo "       Per-subscription remediation would fail. Likely causes: you lack User Access Administrator" >&2
+    echo "       to create the grants, or the role-assignment reads were throttled. Verify access and re-run." >&2
     exit 1
   }
 fi
@@ -252,7 +286,17 @@ for sub in $SUBS; do
     --policy-assignment "$ASSIGNMENT_ID" --resource-discovery-mode ReEvaluateCompliance >/dev/null \
     || failed="$failed $sub"
 done
-[[ -z "$failed" ]] || echo "WARNING: onboarding may be incomplete on:$failed — could not clear a conflicting deployment or start remediation (insufficient access?). Re-running is safe." >&2
+# Honest exit code: if any subscription could not be healed or have remediation started, this run is
+# INCOMPLETE — exit non-zero so a caller keying off the exit status (and the operator) knows to re-run,
+# rather than printing the success banner over a partial fan-in. The remaining subscriptions' fan-in is
+# unaffected and continues in the background; a re-run retries only the ones listed.
+if [[ -n "$failed" ]]; then
+  echo "" >&2
+  echo "WARNING: onboarding is INCOMPLETE on:$failed" >&2
+  echo "  — could not clear a conflicting deployment or start remediation there (insufficient access /" >&2
+  echo "  throttling?). Re-running is safe and retries only those subscriptions." >&2
+  exit 1
+fi
 
 echo ""
 echo "ARMO CDR: tenant onboarding submitted. Activity-Log fan-in completes asynchronously"
