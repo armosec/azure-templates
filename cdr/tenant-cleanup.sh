@@ -7,8 +7,9 @@
 # script does the full cleanup, in the order that avoids orphans:
 #
 #   1. Resolve everything the later steps depend on — the remediation identity, its role assignments,
-#      and the in-scope subscription list — BEFORE deleting anything, since the policy assignment is
-#      what makes them discoverable. Abort if the subscription list can't be resolved.
+#      the collector identity's reconcile grants, and the in-scope subscription list — BEFORE deleting
+#      anything, since the policy assignment / collector identity are what make them discoverable. Abort
+#      if the subscription list can't be resolved.
 #   2. Cancel + delete the remediation task, then delete the policy assignment and definition.
 #      First, so nothing recreates the diagnostic settings mid-teardown: deleting the assignment does
 #      NOT synchronously cancel an in-flight remediation, so a running task's deployments could still
@@ -17,7 +18,9 @@
 #      management group, plus the one main.bicep puts on the security subscription itself (which the
 #      management-group sweep won't cover if the security sub sits outside the torn-down MG).
 #   4. Delete the remediation identity's role assignments (Monitoring Contributor at the management
-#      group; Event Hub listKeys in the security subscription) by resource ID.
+#      group; Event Hub listKeys in the security subscription) by resource ID, then remove the collector
+#      identity's reconcile grants (Management Group Reader, Resource Policy Contributor, and the custom
+#      ARMO CDR Subscription Registrar role) and delete that custom role definition.
 #   5. Optionally delete the central collector stack (its resource group) in the security
 #      subscription.
 # Also deletes the two ARM deployment RECORDS (the management-group `armo-cdr-tenant-policy` and, with
@@ -55,6 +58,12 @@ POLICY_NAME="armo-cdr-activitylog"
 REMEDIATION_NAME="armo-cdr-activitylog-remediation"
 TENANT_POLICY_DEPLOY_NAME="armo-cdr-tenant-policy" # `az deployment mg create` name (tenant-policy.bicep)
 CENTRAL_DEPLOY_NAME="armo-cdr"                      # `az deployment sub create` name (main.bicep)
+COLLECTOR_IDENTITY_NAME="armo-cdr-collector"           # the collector's user-assigned identity (resources.bicep)
+REGISTRAR_ROLE_NAME="ARMO CDR Subscription Registrar"  # custom role granted to the collector (tenant-onboard.sh)
+# The two built-in roles onboarding grants the collector (besides the custom role), so teardown removes
+# ONLY what we granted rather than every assignment the identity happens to hold.
+MG_READER_ROLE_ID="ac63b705-f282-497d-ac71-919bf39d939d"                    # built-in Management Group Reader
+RESOURCE_POLICY_CONTRIBUTOR_ROLE_ID="36243c78-bf99-498c-9df9-86d9f8d28608"  # built-in Resource Policy Contributor
 DELETE_CENTRAL_STACK=false
 ALLOW_NO_SUBS=false
 DRY_RUN=false
@@ -206,6 +215,67 @@ if [[ -n "$PRINCIPAL_ID" ]]; then
   fi
 fi
 
+# Capture the COLLECTOR identity's management-group role assignments (the reconcile-loop grants) by
+# resource ID, while the identity still resolves. --delete-central-stack removes the identity in step 5,
+# after which its assignments would be dangling and undiscoverable from here. Deleting by ID (step 4b)
+# needs no principal lookup afterwards. The custom role definition itself is deleted in step 4b, after
+# these assignments are gone (Azure blocks deleting a role definition that still has live assignments).
+echo "== Resolving the collector identity's reconcile grants =="
+COLLECTOR_ROLE_ASSIGNMENT_IDS=""
+id_err="$(mktemp)"
+# Distinguish a genuinely-absent identity (already removed on a re-run, or the central stack was never
+# deployed) — tolerable — from any OTHER failure (permission / throttling), which must not be mistaken
+# for "gone": that would skip the grant cleanup silently and leave orphaned management-group assignments.
+if COLLECTOR_PRINCIPAL_ID="$(az identity show --name "$COLLECTOR_IDENTITY_NAME" --resource-group "$RESOURCE_GROUP" \
+    --subscription "$SECURITY_SUB" --query principalId -o tsv 2>"$id_err")"; then
+  :
+elif grep -qiE "not found|does not exist|[A-Za-z]+NotFound" "$id_err"; then
+  COLLECTOR_PRINCIPAL_ID=""
+else
+  echo "  WARNING: could not resolve collector identity '${COLLECTOR_IDENTITY_NAME}' (permission / throttling?):" >&2
+  cat "$id_err" >&2
+  echo "  its management-group grants may be left behind — check by hand and re-run." >&2
+  FAILURES=$((FAILURES + 1))
+  COLLECTOR_PRINCIPAL_ID=""
+fi
+rm -f "$id_err"
+if [[ -n "$COLLECTOR_PRINCIPAL_ID" ]]; then
+  # Capture ONLY the assignments this onboarding created — the two built-ins (matched client-side on
+  # roleDefinitionId, since `--role <GUID>` does not match at management-group scope) and the custom role
+  # (matched by name) — never every assignment the collector identity happens to hold, so an unrelated
+  # grant on this identity is left untouched.
+  cra_err="$(mktemp)"
+  cra_ok=true
+  for filter in \
+    "[?contains(roleDefinitionId, '${MG_READER_ROLE_ID}')].id" \
+    "[?contains(roleDefinitionId, '${RESOURCE_POLICY_CONTRIBUTOR_ROLE_ID}')].id"; do
+    if ids="$(az role assignment list --scope "$MG_SCOPE" --assignee-object-id "$COLLECTOR_PRINCIPAL_ID" \
+                --fill-principal-name false --fill-role-definition-name false \
+                --query "$filter" -o tsv 2>"$cra_err")"; then
+      [[ -n "$ids" ]] && COLLECTOR_ROLE_ASSIGNMENT_IDS+="${ids}"$'\n'
+    else
+      cra_ok=false
+    fi
+  done
+  if reg_ids="$(az role assignment list --scope "$MG_SCOPE" --assignee-object-id "$COLLECTOR_PRINCIPAL_ID" \
+                  --fill-principal-name false --fill-role-definition-name false \
+                  --role "$REGISTRAR_ROLE_NAME" --query '[].id' -o tsv 2>>"$cra_err")"; then
+    [[ -n "$reg_ids" ]] && COLLECTOR_ROLE_ASSIGNMENT_IDS+="${reg_ids}"$'\n'
+  else
+    cra_ok=false
+  fi
+  if [[ "$cra_ok" != "true" ]]; then
+    echo "  WARNING: could not list some of the collector identity's role assignments at ${MG_SCOPE}:" >&2
+    cat "$cra_err" >&2
+    echo "  some grants may be left behind — check the management group's IAM by hand." >&2
+    FAILURES=$((FAILURES + 1))
+  fi
+  rm -f "$cra_err"
+else
+  echo "  collector identity '${COLLECTOR_IDENTITY_NAME}' not resolvable here — the custom-role delete in" >&2
+  echo "  step 4b still runs and reports if the role (or a live assignment) remains." >&2
+fi
+
 echo "== Resolving in-scope subscriptions =="
 if ! MG_JSON="$(az account management-group show --name "$MG" --expand --recurse -o json 2>&1)"; then
   echo "error: could not enumerate subscriptions under '${MG}':" >&2
@@ -310,6 +380,26 @@ else
   echo "  If an earlier run reported errors removing role assignments, check the management group and" >&2
   echo "  Event Hub namespace scopes for leftovers by hand (expected clean on a normal re-run)." >&2
 fi
+
+# 4b. Remove the collector identity's management-group grants (captured in step 1), then delete the custom
+# role definition. Assignments FIRST: Azure blocks deleting a role definition that still has live
+# assignments. Runs regardless of --delete-central-stack — these are management-group / tenant-level
+# objects that `az group delete` (step 5) never removes, so they would orphan otherwise.
+echo "== Removing the collector identity's reconcile grants =="
+if [[ -n "${COLLECTOR_ROLE_ASSIGNMENT_IDS//[[:space:]]/}" ]]; then
+  while read -r ra_id; do
+    [[ -n "$ra_id" ]] || continue
+    # || true: keep removing the remaining assignments even if one delete fails (counted by run()).
+    run az role assignment delete --ids "$ra_id" || true
+  done <<<"$COLLECTOR_ROLE_ASSIGNMENT_IDS"
+else
+  echo "  none found for the collector identity — already removed, or the identity is gone"
+fi
+# Delete the custom role definition (best-effort). It is tenant/management-group-scoped and survives
+# `az group delete`, so it would orphan otherwise. Tolerated no-op if already gone; if it still has live
+# assignments (e.g. a grant delete above failed), az reports it and run() counts it for a re-run.
+echo "== Deleting the custom role definition '${REGISTRAR_ROLE_NAME}' =="
+run az role definition delete --name "$REGISTRAR_ROLE_NAME" --scope "$MG_SCOPE" || true
 
 # 5. Optionally delete the central collector stack (its resource group).
 if [[ "$DELETE_CENTRAL_STACK" == "true" ]]; then
