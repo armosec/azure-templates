@@ -4,9 +4,11 @@
 # Runs AFTER the central collector has been deployed into the security subscription (the single
 # `az deployment sub create`, emitted inline by the onboarding command). This script performs the
 # management-group half of onboarding: assign the DINE policy at the tenant root, grant the policy's
-# remediation identity the roles it needs, and kick off remediation so every already-existing
-# subscription streams its Activity Log to the central Event Hub. Subscriptions created later are
-# wired automatically by the policy, with no re-run.
+# remediation identity the roles it needs, grant the collector identity the roles its new-subscription
+# reconcile loop needs, and kick off remediation so every already-existing subscription streams its
+# Activity Log to the central Event Hub. Subscriptions created later are wired by the collector's
+# reconcile loop (the DINE policy alone does not evaluate a new subscription promptly, nor can its
+# identity register the provider a new subscription needs).
 #
 # It is the inverse of tenant-cleanup.sh and mirrors its shape (arg parsing, run() helper, honest
 # exit code). Delivered as a DOWNLOADED script — curl'd to a file and run, not pasted inline — so its
@@ -48,6 +50,11 @@ TENANT_POLICY_DEPLOY_NAME="armo-cdr-tenant-policy"
 SEND_RULE_NAME="armo-cdr-diagnostics-send"
 MONITORING_CONTRIBUTOR_ROLE_ID="749f88d5-cbae-40b8-bcfc-e573ddc772fa" # built-in; matches tenant-policy.bicep
 EVENTHUB_DATA_OWNER_ROLE="Azure Event Hubs Data Owner"
+COLLECTOR_IDENTITY_NAME="armo-cdr-collector"  # the collector's user-assigned identity (resources.bicep)
+# Roles the collector identity's new-subscription reconcile loop needs at the management-group root.
+MG_READER_ROLE_ID="ac63b705-f282-497d-ac71-919bf39d939d"                    # built-in Management Group Reader
+RESOURCE_POLICY_CONTRIBUTOR_ROLE_ID="36243c78-bf99-498c-9df9-86d9f8d28608"  # built-in Resource Policy Contributor
+REGISTRAR_ROLE_NAME="ARMO CDR Subscription Registrar"                       # custom role defined below
 DRY_RUN=false
 ASSUME_YES=false
 
@@ -234,6 +241,109 @@ if [[ "$DRY_RUN" != "true" ]]; then
     exit 1
   }
 fi
+
+# 4c. Grant the COLLECTOR identity the roles its new-subscription reconcile loop needs. This is a
+# DIFFERENT principal from the policy remediation identity above: the collector (a user-assigned identity
+# created with the central stack) runs a loop that wires subscriptions added after onboarding — it lists
+# subscriptions, registers Microsoft.Insights, clears stale remediation-deployment records, and triggers
+# the policy's per-subscription remediation. The diagnostic-setting deployment is still performed by the
+# policy identity (Monitoring Contributor, granted above); the collector only starts remediation.
+echo "== Granting the collector identity its reconcile roles =="
+if [[ "$DRY_RUN" == "true" ]]; then
+  COLLECTOR_PRINCIPAL="00000000-0000-0000-0000-000000000000" # placeholder; no reads in dry-run
+else
+  # Resolve the collector's principal id from its user-assigned identity. Fail closed: the central-stack
+  # deploy that creates it runs before this script, so a missing identity means a broken onboarding, not a
+  # state to press past.
+  COLLECTOR_PRINCIPAL="$(az identity show --name "$COLLECTOR_IDENTITY_NAME" --resource-group "$RESOURCE_GROUP" \
+    --subscription "$SECURITY_SUB" --query principalId -o tsv)" || {
+    echo "error: could not resolve collector identity '${COLLECTOR_IDENTITY_NAME}' in resource group '${RESOURCE_GROUP}' (subscription '${SECURITY_SUB}') — is the central collector stack deployed?" >&2; exit 1; }
+  [[ -n "$COLLECTOR_PRINCIPAL" ]] || {
+    echo "error: collector identity '${COLLECTOR_IDENTITY_NAME}' has no principal id — is the central collector stack deployed?" >&2; exit 1; }
+fi
+echo "collector identity: ${COLLECTOR_PRINCIPAL}"
+
+# Ensure the custom role exists. A narrow role — exactly the three actions the loop needs — rather than a
+# built-in that includes */register/action (e.g. Contributor), which is far too broad to grant tenant-wide.
+# deployments/delete is for the stale-record self-heal. Idempotent: create only when absent (a re-onboard
+# reuses it). Fail closed on a read we can't complete, exactly like the grant reads below.
+#
+# Constraint: the role NAME is tenant-global while AssignableScopes is pinned to this MG. So if the SAME
+# tenant is ever onboarded at a SECOND management group (the script permits any --management-group), the
+# read below finds nothing at the new scope, this create runs, and Azure rejects it with
+# RoleDefinitionWithSameNameExists — a bare run() then aborts (fail-closed, but with a non-obvious error).
+# Not a concern for V1 (whole-tenant is pre-release and tenant-root-only); if MG tiers are ever exposed,
+# either look the role up by name tenant-wide and extend its AssignableScopes, or make the name scope-unique.
+role_present=""
+if [[ "$DRY_RUN" != "true" ]]; then
+  role_present="$(az role definition list --custom-role-only true --name "$REGISTRAR_ROLE_NAME" --scope "$MG_SCOPE" --query '[0].roleName' -o tsv)" || {
+    echo "error: could not read custom role definitions at the management group (throttling / access?) — re-run." >&2; exit 1; }
+fi
+if [[ -n "$role_present" ]]; then
+  echo "  custom role '${REGISTRAR_ROLE_NAME}' already defined — skipping"
+else
+  run az role definition create --role-definition "$(cat <<JSON
+{
+  "Name": "${REGISTRAR_ROLE_NAME}",
+  "Description": "ARMO CDR: register Microsoft.Insights / Microsoft.PolicyInsights and delete stale policy-remediation deployment records, for the collector's new-subscription reconcile loop.",
+  "Actions": [
+    "Microsoft.Insights/register/action",
+    "Microsoft.PolicyInsights/register/action",
+    "Microsoft.Resources/deployments/delete"
+  ],
+  "AssignableScopes": ["${MG_SCOPE}"]
+}
+JSON
+)"
+  # A freshly-created custom role definition is not immediately assignable — wait until it is readable at
+  # the assignment scope before granting it, so a first onboard doesn't need a re-run to get past this.
+  # Fail fast (like the remediation-grant readback) if it never becomes readable, so the cause is clear
+  # rather than surfacing below as a cryptic "role not found" role-assignment error.
+  if [[ "$DRY_RUN" != "true" ]]; then
+    role_ready=false
+    for _ in $(seq 1 12); do
+      if [[ -n "$(az role definition list --custom-role-only true --name "$REGISTRAR_ROLE_NAME" --scope "$MG_SCOPE" --query '[0].roleName' -o tsv 2>/dev/null || true)" ]]; then
+        role_ready=true; break
+      fi
+      sleep 5
+    done
+    [[ "$role_ready" == "true" ]] || {
+      echo "error: custom role '${REGISTRAR_ROLE_NAME}' did not become readable within the timeout (RBAC" >&2
+      echo "       replication lag) — its grants below would fail with a less actionable error. The role" >&2
+      echo "       definition was created and should be readable shortly; re-run." >&2
+      exit 1
+    }
+  fi
+fi
+
+# Grant the collector its three roles at the management-group root, with the same idempotency + fail-closed
+# reads as the policy-identity grants: create each only when absent (az role assignment create crashes on
+# an existing MG assignment), and a NON-ZERO read (throttling / access) must abort rather than be mistaken
+# for "absent". At management-group scope `--role <GUID>` does not match on reads, so the built-in roles are
+# checked client-side on roleDefinitionId; the custom role matches by name.
+grant_collector_mg_role() { # $1 = human name (log), $2 = present-id, $3 = role (GUID or name)
+  if [[ -n "$2" ]]; then
+    echo "  $1 already granted to the collector at the management group — skipping"
+  else
+    run az role assignment create --assignee-object-id "$COLLECTOR_PRINCIPAL" --assignee-principal-type ServicePrincipal \
+      --role "$3" --scope "$MG_SCOPE"
+  fi
+}
+reader_present=""; rpc_present=""; registrar_present=""
+if [[ "$DRY_RUN" != "true" ]]; then
+  reader_present="$(az role assignment list --scope "$MG_SCOPE" --assignee-object-id "$COLLECTOR_PRINCIPAL" \
+    --query "[?contains(roleDefinitionId, '$MG_READER_ROLE_ID')].id | [0]" -o tsv)" || {
+    echo "error: could not read the collector's role assignments at the management group (throttling / access?) — re-run." >&2; exit 1; }
+  rpc_present="$(az role assignment list --scope "$MG_SCOPE" --assignee-object-id "$COLLECTOR_PRINCIPAL" \
+    --query "[?contains(roleDefinitionId, '$RESOURCE_POLICY_CONTRIBUTOR_ROLE_ID')].id | [0]" -o tsv)" || {
+    echo "error: could not read the collector's role assignments at the management group (throttling / access?) — re-run." >&2; exit 1; }
+  registrar_present="$(az role assignment list --scope "$MG_SCOPE" --assignee-object-id "$COLLECTOR_PRINCIPAL" \
+    --role "$REGISTRAR_ROLE_NAME" --query '[0].id' -o tsv)" || {
+    echo "error: could not read the collector's role assignments at the management group (throttling / access?) — re-run." >&2; exit 1; }
+fi
+grant_collector_mg_role "Management Group Reader" "$reader_present" "$MG_READER_ROLE_ID"
+grant_collector_mg_role "Resource Policy Contributor" "$rpc_present" "$RESOURCE_POLICY_CONTRIBUTOR_ROLE_ID"
+grant_collector_mg_role "custom role '${REGISTRAR_ROLE_NAME}'" "$registrar_present" "$REGISTRAR_ROLE_NAME"
 
 # 5. Kick off a fresh compliance evaluation + remediation PER SUBSCRIPTION. Per-subscription because
 # ReEvaluateCompliance (the only way not to wait on Azure's passive evaluation cycle) is rejected at
