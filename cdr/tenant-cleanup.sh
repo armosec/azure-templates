@@ -149,6 +149,18 @@ run() {
     echo "  (already gone)"
     return 0
   fi
+  #
+  # (3) Disabled / cancelled subscription: a cancelled subscription (or one in the post-cancel
+  # grace period) rejects every write with "ReadOnlyDisabledSubscription", even though `az account`
+  # may still list it as Enabled. Such a subscription cannot run a remediation (so nothing can
+  # recreate a diagnostic setting) and forwards no Activity Log, so its ARMO artifacts are inert and
+  # are removed together with the subscription when it is finally deleted. Tolerate the write-block as
+  # a no-op so a single disabled subscription under the management group does not abort the whole
+  # tenant teardown — the log flow is already stopped there, which is what teardown guarantees.
+  if grep -qiE "ReadOnlyDisabledSubscription|disabled and therefore marked as read only" <<<"$out"; then
+    echo "  (subscription disabled/read-only — skipped; its inert artifacts clear when the subscription is deleted)"
+    return 0
+  fi
   echo "  WARNING: command failed (rc=${rc}):" >&2
   echo "${out}" >&2
   FAILURES=$((FAILURES + 1))
@@ -307,8 +319,9 @@ fi
 #
 # Cancel is best-effort ACROSS subscriptions (one sub's failure must not strand the rest) but fail-closed
 # in AGGREGATE: if any cancel fails for a real reason — permissions/throttling, NOT the tolerated
-# already-terminal / already-gone no-ops that run() returns 0 for — abort BEFORE deleting the policy, so
-# the assignment is never removed while a remediation we couldn't stop keeps recreating settings.
+# already-terminal / already-gone / disabled-subscription no-ops that run() returns 0 for — abort BEFORE
+# deleting the policy, so the assignment is never removed while a remediation we couldn't stop keeps
+# recreating settings. A disabled/read-only subscription is safe to skip: it cannot run a remediation.
 echo "== Cancelling the remediation task(s) =="
 cancel_failed=""
 run az policy remediation cancel --name "$REMEDIATION_NAME" --management-group "$MG" || cancel_failed="$cancel_failed mg"
