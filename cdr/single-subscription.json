@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.46.1.21595",
-      "templateHash": "15410820700678270657"
+      "templateHash": "7065526217574659320"
     }
   },
   "parameters": {
@@ -202,7 +202,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.46.1.21595",
-              "templateHash": "13354317514554037923"
+              "templateHash": "17445226905851862342"
             }
           },
           "parameters": {
@@ -481,6 +481,10 @@
                         {
                           "name": "CONNECTION_LEVEL",
                           "value": "[parameters('connectionLevel')]"
+                        },
+                        {
+                          "name": "SECURITY_SUBSCRIPTION_ID",
+                          "value": "[subscription().subscriptionId]"
                         },
                         {
                           "name": "HEARTBEAT_INTERVAL",
