@@ -295,10 +295,11 @@ else
 }
 JSON
 )"
-  # A freshly-created custom role definition is not immediately assignable — wait until it is readable at
-  # the assignment scope before granting it, so a first onboard doesn't need a re-run to get past this.
-  # Fail fast (like the remediation-grant readback) if it never becomes readable, so the cause is clear
-  # rather than surfacing below as a cryptic "role not found" role-assignment error.
+  # A freshly-created custom role definition is not immediately assignable. Wait until it is at least
+  # readable at the assignment scope — necessary but NOT sufficient: `role definition list` (here) and
+  # `az role assignment create`'s name resolution (the grant below) sit on different RBAC replicas, so the
+  # role can be listable yet still not-assignable-by-name. This wait only narrows that window; the grant
+  # itself is retried below to actually close it. Fail fast if it never even becomes readable.
   if [[ "$DRY_RUN" != "true" ]]; then
     role_ready=false
     for _ in $(seq 1 12); do
@@ -343,7 +344,75 @@ if [[ "$DRY_RUN" != "true" ]]; then
 fi
 grant_collector_mg_role "Management Group Reader" "$reader_present" "$MG_READER_ROLE_ID"
 grant_collector_mg_role "Resource Policy Contributor" "$rpc_present" "$RESOURCE_POLICY_CONTRIBUTOR_ROLE_ID"
-grant_collector_mg_role "custom role '${REGISTRAR_ROLE_NAME}'" "$registrar_present" "$REGISTRAR_ROLE_NAME"
+
+# The custom role is granted by name, and `az role assignment create` resolves that name on a different
+# RBAC replica than the `role definition list` readback above — so a role that just passed the readback
+# can still fail here with "Role '<name>' doesn't exist" on a fresh onboard. Attempting the assignment is
+# the only reliable test of assignability, so retry it on that transient signature only — a genuine
+# failure (e.g. AuthorizationFailed) aborts immediately below. Re-check presence each round to narrow the
+# window where an attempt that succeeded server-side but whose CLI call errored would be retried into
+# `az role assignment create`'s crash-on-existing-assignment path (the re-check resolves the same lagging
+# name, so it narrows rather than closes that window; a create onto an existing assignment still self-heals:
+# the failure is caught and the next round's read finds it).
+if [[ -n "$registrar_present" ]]; then
+  echo "  custom role '${REGISTRAR_ROLE_NAME}' already granted to the collector at the management group — skipping"
+elif [[ "$DRY_RUN" == "true" ]]; then
+  run az role assignment create --assignee-object-id "$COLLECTOR_PRINCIPAL" --assignee-principal-type ServicePrincipal \
+    --role "$REGISTRAR_ROLE_NAME" --scope "$MG_SCOPE"
+else
+  registrar_granted=false
+  registrar_err=""
+  for _ in $(seq 1 18); do
+    # Re-check presence first: an earlier attempt may have created the assignment server-side even if its
+    # CLI call errored, and `az role assignment create` crashes when the assignment already exists. Trust
+    # ONLY a successful read: a read that itself fails (throttling / access) must NOT be taken as "absent"
+    # — that could drive a create into an already-existing assignment — so retry the read instead, matching
+    # the fail-closed-on-read convention the other grants use.
+    if existing=$(az role assignment list --scope "$MG_SCOPE" --assignee-object-id "$COLLECTOR_PRINCIPAL" \
+                   --role "$REGISTRAR_ROLE_NAME" --query '[0].id' -o tsv 2>/dev/null); then
+      [[ -n "$existing" ]] && { registrar_granted=true; break; }
+    else
+      # Retain this as the latest error too, so if the loop exhausts on read failures alone the final
+      # report surfaces a real cause instead of a bare "Last error:".
+      registrar_err="could not read the collector's role assignments at the management group (throttling / access?)"
+      echo "  ${registrar_err} — retrying in 10s..." >&2
+      sleep 10; continue
+    fi
+    echo "+ az role assignment create --assignee-object-id $COLLECTOR_PRINCIPAL --assignee-principal-type ServicePrincipal --role '$REGISTRAR_ROLE_NAME' --scope $MG_SCOPE" >&2
+    # Capture stdout+stderr so a genuine (non-lag) failure is surfaced below instead of masked as "lag".
+    if registrar_err=$(az role assignment create --assignee-object-id "$COLLECTOR_PRINCIPAL" --assignee-principal-type ServicePrincipal \
+         --role "$REGISTRAR_ROLE_NAME" --scope "$MG_SCOPE" 2>&1); then
+      registrar_granted=true; break
+    fi
+    # An attempt that landed server-side but errored in the CLI leaves the assignment EXISTING; az then
+    # crashes on the MG-scope role-id lookup with "IndexError: list index out of range" (the same quirk
+    # documented at the built-in grants above). That is the self-heal case — keep retrying so the next
+    # round's presence read confirms it, rather than aborting a tenant that is actually wired correctly.
+    if grep -qiE "RoleAssignmentExists|list index out of range" <<<"$registrar_err"; then
+      echo "  assignment appears to already exist — re-checking in 10s..." >&2
+      sleep 10; continue
+    fi
+    # Retry ONLY the RBAC-replication-lag signature ("Role '<name>' doesn't exist"). A genuine failure
+    # (AuthorizationFailed — operator lacks User Access Administrator; PrincipalNotFound — a bad principal;
+    # ...) must abort immediately with the real error — matching the fail-closed convention the sibling
+    # grants use — rather than burn 18 rounds of ARM writes. The lag match is deliberately narrow so
+    # "... does not exist in the directory" (PrincipalNotFound) is NOT treated as lag.
+    grep -qE "Role '[^']*' doesn't exist|RoleDefinitionDoesNotExist" <<<"$registrar_err" || {
+      echo "error: assigning custom role '${REGISTRAR_ROLE_NAME}' failed for a non-transient reason:" >&2
+      echo "       ${registrar_err}" >&2
+      exit 1
+    }
+    echo "  custom role not yet assignable — retrying in 10s (transient if this is RBAC replication lag)..." >&2
+    sleep 10
+  done
+  [[ "$registrar_granted" == "true" ]] || {
+    echo "error: could not assign custom role '${REGISTRAR_ROLE_NAME}' to the collector after retries." >&2
+    echo "       Last error: ${registrar_err}" >&2
+    echo "       If this was RBAC replication lag, the role definition already exists and a re-run is safe;" >&2
+    echo "       otherwise the error above is the real cause and a re-run will not help." >&2
+    exit 1
+  }
+fi
 
 # 5. Kick off a fresh compliance evaluation + remediation PER SUBSCRIPTION. Per-subscription because
 # ReEvaluateCompliance (the only way not to wait on Azure's passive evaluation cycle) is rejected at
