@@ -422,6 +422,25 @@ fi
 echo "== Kicking off remediation across in-scope subscriptions =="
 failed=""
 for sub in $SUBS; do
+  # Skip a subscription whose remediation is already running. The collector's reconcile loop gets its
+  # read access in step 4c — before this loop reaches every subscription — and polls every couple of
+  # minutes while nothing is covered, so it can start a subscription's remediation, under this same
+  # name, first; a re-run while remediations are still in flight hits the same case. Clearing that
+  # remediation's PolicyDeployment_* record below and re-creating it would at best disturb a remediation
+  # that is already wiring the subscription, and at worst fail the create and report the onboard
+  # INCOMPLETE though the wiring is proceeding. Mirrors the loop's own in-progress check (wire, in
+  # pkg/reconcile): any state other than the terminal Succeeded / Failed / Canceled (or none) is
+  # running. Best-effort read: a missing remediation (or one we can't read) leaves the state empty and
+  # falls through to the normal path below. Guarded from --dry-run (live read).
+  if [[ "$DRY_RUN" != "true" ]]; then
+    rem_state="$(az policy remediation show --name "$REMEDIATION_NAME" --subscription "$sub" \
+      --query provisioningState -o tsv 2>/dev/null || true)"
+    # Case-insensitive by enumeration rather than ${var,,}, which needs bash 4 (macOS ships 3.2).
+    case "$rem_state" in
+      ""|[Ss]ucceeded|[Ff]ailed|[Cc]anceled|[Cc]ancelled) ;;
+      *) echo "  ${sub}: remediation already in progress (${rem_state}) — skipping"; continue ;;
+    esac
+  fi
   # Self-heal a re-onboard. Azure Policy names each remediation deployment deterministically from the
   # (fixed) policy name + subscription, so a previous onboarding of this tenant leaves a same-named
   # PolicyDeployment_* record in the subscription's deployment history. Teardown removes the diagnostic
