@@ -274,9 +274,11 @@ echo "collector identity: ${COLLECTOR_PRINCIPAL}"
 # RoleDefinitionWithSameNameExists — a bare run() then aborts (fail-closed, but with a non-obvious error).
 # Not a concern for V1 (whole-tenant is pre-release and tenant-root-only); if MG tiers are ever exposed,
 # either look the role up by name tenant-wide and extend its AssignableScopes, or make the name scope-unique.
+# role_present holds the definition's id (its GUID `name`) once known: the collector-grant presence reads
+# below match on it, because resolving the role by NAME lags on a fresh definition (see there).
 role_present=""
 if [[ "$DRY_RUN" != "true" ]]; then
-  role_present="$(az role definition list --custom-role-only true --name "$REGISTRAR_ROLE_NAME" --scope "$MG_SCOPE" --query '[0].roleName' -o tsv)" || {
+  role_present="$(az role definition list --custom-role-only true --name "$REGISTRAR_ROLE_NAME" --scope "$MG_SCOPE" --query '[0].name' -o tsv)" || {
     echo "error: could not read custom role definitions at the management group (throttling / access?) — re-run." >&2; exit 1; }
 fi
 if [[ -n "$role_present" ]]; then
@@ -303,7 +305,8 @@ JSON
   if [[ "$DRY_RUN" != "true" ]]; then
     role_ready=false
     for _ in $(seq 1 12); do
-      if [[ -n "$(az role definition list --custom-role-only true --name "$REGISTRAR_ROLE_NAME" --scope "$MG_SCOPE" --query '[0].roleName' -o tsv 2>/dev/null || true)" ]]; then
+      role_present="$(az role definition list --custom-role-only true --name "$REGISTRAR_ROLE_NAME" --scope "$MG_SCOPE" --query '[0].name' -o tsv 2>/dev/null || true)"
+      if [[ -n "$role_present" ]]; then
         role_ready=true; break
       fi
       sleep 5
@@ -320,8 +323,9 @@ fi
 # Grant the collector its three roles at the management-group root, with the same idempotency + fail-closed
 # reads as the policy-identity grants: create each only when absent (az role assignment create crashes on
 # an existing MG assignment), and a NON-ZERO read (throttling / access) must abort rather than be mistaken
-# for "absent". At management-group scope `--role <GUID>` does not match on reads, so the built-in roles are
-# checked client-side on roleDefinitionId; the custom role matches by name.
+# for "absent". At management-group scope `--role <GUID>` does not match on reads, so all three roles — the
+# built-ins and the custom role — are checked client-side on roleDefinitionId (the custom role's id read
+# above; a `--role <name>` read lags on a fresh definition).
 grant_collector_mg_role() { # $1 = human name (log), $2 = present-id, $3 = role (GUID or name)
   if [[ -n "$2" ]]; then
     echo "  $1 already granted to the collector at the management group — skipping"
@@ -338,8 +342,15 @@ if [[ "$DRY_RUN" != "true" ]]; then
   rpc_present="$(az role assignment list --scope "$MG_SCOPE" --assignee-object-id "$COLLECTOR_PRINCIPAL" \
     --query "[?contains(roleDefinitionId, '$RESOURCE_POLICY_CONTRIBUTOR_ROLE_ID')].id | [0]" -o tsv)" || {
     echo "error: could not read the collector's role assignments at the management group (throttling / access?) — re-run." >&2; exit 1; }
+  # An empty id would make the contains() filter below match ANY of the collector's assignments and skip the
+  # grant. Both paths above set it (read, or the post-create readback that exits on timeout); fail closed.
+  [[ -n "$role_present" ]] || {
+    echo "error: custom role '${REGISTRAR_ROLE_NAME}' has no definition id at the management group — re-run." >&2; exit 1; }
+  # Match the custom role on its definition id, client-side, like the built-ins above — NOT `--role <name>`:
+  # that resolves the name, which lags on a just-created definition ("Role '<name>' doesn't exist") and,
+  # being a read outside the grant's retry below, would abort a fresh onboard.
   registrar_present="$(az role assignment list --scope "$MG_SCOPE" --assignee-object-id "$COLLECTOR_PRINCIPAL" \
-    --role "$REGISTRAR_ROLE_NAME" --query '[0].id' -o tsv)" || {
+    --query "[?contains(roleDefinitionId, '$role_present')].id | [0]" -o tsv)" || {
     echo "error: could not read the collector's role assignments at the management group (throttling / access?) — re-run." >&2; exit 1; }
 fi
 grant_collector_mg_role "Management Group Reader" "$reader_present" "$MG_READER_ROLE_ID"
@@ -351,9 +362,10 @@ grant_collector_mg_role "Resource Policy Contributor" "$rpc_present" "$RESOURCE_
 # the only reliable test of assignability, so retry it on that transient signature only — a genuine
 # failure (e.g. AuthorizationFailed) aborts immediately below. Re-check presence each round to narrow the
 # window where an attempt that succeeded server-side but whose CLI call errored would be retried into
-# `az role assignment create`'s crash-on-existing-assignment path (the re-check resolves the same lagging
-# name, so it narrows rather than closes that window; a create onto an existing assignment still self-heals:
-# the failure is caught and the next round's read finds it).
+# `az role assignment create`'s crash-on-existing-assignment path (the re-check matches the definition id, so
+# it doesn't depend on the lagging name, but a just-written assignment can still be missing from the list
+# for a moment — it narrows rather than closes that window; a create onto an existing assignment still
+# self-heals: the failure is caught and the next round's read finds it).
 if [[ -n "$registrar_present" ]]; then
   echo "  custom role '${REGISTRAR_ROLE_NAME}' already granted to the collector at the management group — skipping"
 elif [[ "$DRY_RUN" == "true" ]]; then
@@ -369,7 +381,7 @@ else
     # — that could drive a create into an already-existing assignment — so retry the read instead, matching
     # the fail-closed-on-read convention the other grants use.
     if existing=$(az role assignment list --scope "$MG_SCOPE" --assignee-object-id "$COLLECTOR_PRINCIPAL" \
-                   --role "$REGISTRAR_ROLE_NAME" --query '[0].id' -o tsv 2>/dev/null); then
+                   --query "[?contains(roleDefinitionId, '$role_present')].id | [0]" -o tsv 2>/dev/null); then
       [[ -n "$existing" ]] && { registrar_granted=true; break; }
     else
       # Retain this as the latest error too, so if the loop exhausts on read failures alone the final
