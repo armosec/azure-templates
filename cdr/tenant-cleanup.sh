@@ -234,6 +234,28 @@ fi
 # these assignments are gone (Azure blocks deleting a role definition that still has live assignments).
 echo "== Resolving the collector identity's reconcile grants =="
 COLLECTOR_ROLE_ASSIGNMENT_IDS=""
+# Resolve the custom role's definition id (its GUID `name`) once, for both the assignment match below and
+# the definition delete in step 4b, matching roleName client-side on the custom-role list. Not
+# `role assignment list --role <name>`: that fails "Role ... doesn't exist" when the role is absent (az
+# resolves the name whenever any assignment is visible at the management group, as there normally is) —
+# on a re-run after an earlier run deleted it, or when onboarding stopped before creating it — and the
+# failure is counted, so a teardown with nothing left to do exits non-zero. Empty means no such role is
+# visible here: normally it is already removed (or was never created), and none of its assignments can
+# outlive it. A role created moments ago may not be visible yet (RBAC replication lag, as seen during
+# onboarding), so step 4b says so rather than claiming it is gone.
+REGISTRAR_ROLE_ID=""
+REGISTRAR_ROLE_LOOKUP_OK=true
+rd_err="$(mktemp)"
+if ! REGISTRAR_ROLE_ID="$(az role definition list --custom-role-only true --scope "$MG_SCOPE" \
+    --query "[?roleName=='${REGISTRAR_ROLE_NAME}'].name | [0]" -o tsv 2>"$rd_err")"; then
+  echo "  WARNING: could not list custom role definitions at ${MG_SCOPE} (permission / throttling?):" >&2
+  cat "$rd_err" >&2
+  echo "  the '${REGISTRAR_ROLE_NAME}' role and its grant may be left behind — check by hand and re-run." >&2
+  FAILURES=$((FAILURES + 1))
+  REGISTRAR_ROLE_ID=""
+  REGISTRAR_ROLE_LOOKUP_OK=false
+fi
+rm -f "$rd_err"
 id_err="$(mktemp)"
 # Distinguish a genuinely-absent identity (already removed on a re-run, or the central stack was never
 # deployed) — tolerable — from any OTHER failure (permission / throttling), which must not be mistaken
@@ -252,29 +274,53 @@ else
 fi
 rm -f "$id_err"
 if [[ -n "$COLLECTOR_PRINCIPAL_ID" ]]; then
-  # Capture ONLY the assignments this onboarding created — the two built-ins (matched client-side on
-  # roleDefinitionId, since `--role <GUID>` does not match at management-group scope) and the custom role
-  # (matched by name) — never every assignment the collector identity happens to hold, so an unrelated
-  # grant on this identity is left untouched.
+  # Capture ONLY the assignments this onboarding created — the two built-ins and the custom role, all
+  # matched client-side on roleDefinitionId (`--role <GUID>` does not match at management-group scope, and
+  # `--role <name>` fails once the role is absent, see above) — never every assignment the collector
+  # identity happens to hold, so an unrelated grant on this identity is left untouched. Errors are
+  # appended (2>>), so the warning below shows every failed lookup, not just the last one.
   cra_err="$(mktemp)"
   cra_ok=true
-  for filter in \
-    "[?contains(roleDefinitionId, '${MG_READER_ROLE_ID}')].id" \
-    "[?contains(roleDefinitionId, '${RESOURCE_POLICY_CONTRIBUTOR_ROLE_ID}')].id"; do
+  filters=(
+    "[?contains(roleDefinitionId, '${MG_READER_ROLE_ID}')].id"
+    "[?contains(roleDefinitionId, '${RESOURCE_POLICY_CONTRIBUTOR_ROLE_ID}')].id"
+  )
+  [[ -n "$REGISTRAR_ROLE_ID" ]] && filters+=("[?contains(roleDefinitionId, '${REGISTRAR_ROLE_ID}')].id")
+  for filter in "${filters[@]}"; do
     if ids="$(az role assignment list --scope "$MG_SCOPE" --assignee-object-id "$COLLECTOR_PRINCIPAL_ID" \
                 --fill-principal-name false --fill-role-definition-name false \
-                --query "$filter" -o tsv 2>"$cra_err")"; then
+                --query "$filter" -o tsv 2>>"$cra_err")"; then
       [[ -n "$ids" ]] && COLLECTOR_ROLE_ASSIGNMENT_IDS+="${ids}"$'\n'
     else
       cra_ok=false
     fi
   done
-  if reg_ids="$(az role assignment list --scope "$MG_SCOPE" --assignee-object-id "$COLLECTOR_PRINCIPAL_ID" \
-                  --fill-principal-name false --fill-role-definition-name false \
-                  --role "$REGISTRAR_ROLE_NAME" --query '[].id' -o tsv 2>>"$cra_err")"; then
-    [[ -n "$reg_ids" ]] && COLLECTOR_ROLE_ASSIGNMENT_IDS+="${reg_ids}"$'\n'
-  else
-    cra_ok=false
+  # A role step 1 did not find, while the collector still holds a grant here on a role other than the
+  # two built-ins, most likely means the role exists but is not visible yet (created moments ago, RBAC
+  # replication lag). That grant can't be matched without the role's id, and once
+  # --delete-central-stack removes the identity no later run can find it — so report and count it.
+  if [[ -z "$REGISTRAR_ROLE_ID" && "$REGISTRAR_ROLE_LOOKUP_OK" == "true" ]]; then
+    not_builtin="[?!contains(roleDefinitionId, '${MG_READER_ROLE_ID}')"
+    # Each grant is listed with its role definition, so the operator can tell the registrar grant from an
+    # unrelated one before deleting anything.
+    not_builtin+=" && !contains(roleDefinitionId, '${RESOURCE_POLICY_CONTRIBUTOR_ROLE_ID}')].[id, roleDefinitionId]"
+    if other_grants="$(az role assignment list --scope "$MG_SCOPE" --assignee-object-id "$COLLECTOR_PRINCIPAL_ID" \
+                         --fill-principal-name false --fill-role-definition-name false \
+                         --query "$not_builtin" -o tsv 2>>"$cra_err")"; then
+      if [[ -n "$other_grants" ]]; then
+        echo "  WARNING: '${REGISTRAR_ROLE_NAME}' was not found, yet the collector identity holds" >&2
+        echo "  other grant(s) at ${MG_SCOPE} — likely that role's, if onboarding ran moments ago." >&2
+        echo "  Re-run later. If this run also deletes the central stack, check each grant's role definition:" >&2
+        echo "  delete it with \`az role assignment delete --ids <id>\` only if it is '${REGISTRAR_ROLE_NAME}'," >&2
+        echo "  and leave any other grant alone:" >&2
+        while IFS=$'\t' read -r other_id other_role; do
+          echo "    ${other_id}  (role definition ${other_role})" >&2
+        done <<<"$other_grants"
+        FAILURES=$((FAILURES + 1))
+      fi
+    else
+      cra_ok=false
+    fi
   fi
   if [[ "$cra_ok" != "true" ]]; then
     echo "  WARNING: could not list some of the collector identity's role assignments at ${MG_SCOPE}:" >&2
@@ -284,8 +330,8 @@ if [[ -n "$COLLECTOR_PRINCIPAL_ID" ]]; then
   fi
   rm -f "$cra_err"
 else
-  echo "  collector identity '${COLLECTOR_IDENTITY_NAME}' not resolvable here — the custom-role delete in" >&2
-  echo "  step 4b still runs and reports if the role (or a live assignment) remains." >&2
+  echo "  collector identity '${COLLECTOR_IDENTITY_NAME}' not resolvable here — step 4b still deletes the custom" >&2
+  echo "  role if it exists, and reports if a live assignment blocks the delete." >&2
 fi
 
 echo "== Resolving in-scope subscriptions =="
@@ -409,10 +455,21 @@ else
   echo "  none found for the collector identity — already removed, or the identity is gone"
 fi
 # Delete the custom role definition (best-effort). It is tenant/management-group-scoped and survives
-# `az group delete`, so it would orphan otherwise. Tolerated no-op if already gone; if it still has live
-# assignments (e.g. a grant delete above failed), az reports it and run() counts it for a re-run.
+# `az group delete`, so it would orphan otherwise. Skipped when step 1 found no such role; if it still has
+# live assignments (e.g. a grant delete above failed), az reports it and run() counts it for a re-run.
 echo "== Deleting the custom role definition '${REGISTRAR_ROLE_NAME}' =="
-run az role definition delete --name "$REGISTRAR_ROLE_NAME" --scope "$MG_SCOPE" || true
+if [[ -n "$REGISTRAR_ROLE_ID" ]]; then
+  # By the id resolved in step 1 (a GUID `--name` is matched client-side), so the delete targets exactly
+  # that role definition.
+  run az role definition delete --name "$REGISTRAR_ROLE_ID" --scope "$MG_SCOPE" || true
+elif [[ "$REGISTRAR_ROLE_LOOKUP_OK" == "true" ]]; then
+  echo "  (not found at ${MG_SCOPE} — already removed or never created; if onboarding created it moments"
+  echo "  ago, re-run later)"
+else
+  # The lookup failed (already counted). Fall back to deleting by name: it does its own lookup, and is a
+  # no-op if nothing matches, so the role is still removed when that read succeeds this time.
+  run az role definition delete --name "$REGISTRAR_ROLE_NAME" --scope "$MG_SCOPE" || true
+fi
 
 # 5. Optionally delete the central collector stack (its resource group).
 if [[ "$DELETE_CENTRAL_STACK" == "true" ]]; then
