@@ -15,12 +15,13 @@
 # `set -euo pipefail` and any `exit` affect only this process, never the operator's interactive Cloud
 # Shell (a pasted strict-mode script closes the whole shell on the first non-zero command).
 #
-# It deliberately does NOT block on fan-in completing. Remediation is asynchronous (~10-15 min); making
-# the customer hold a Cloud Shell open that long is what let the session time out mid-run before. This
-# script submits remediation and returns. Per-subscription wiring cannot be confirmed in-band:
-# ReEvaluateCompliance leaves nothing observable for ~13 min, so any short poll would report zero and
-# false-fail every healthy run. Authoritative per-subscription coverage is surfaced out-of-band by the
-# backend (the collector's heartbeat only tells the tenant it is alive, not which subscriptions wired).
+# It deliberately does NOT block on fan-in completing. Remediation is asynchronous (the tenant usually turns
+# Connected within about 35 min of this script finishing); making the customer hold a Cloud Shell open that
+# long is what let the session time out mid-run before. This script submits remediation and returns.
+# Per-subscription wiring cannot be confirmed in-band: ReEvaluateCompliance leaves nothing observable for
+# ~13 min, so any short poll would report zero and false-fail every healthy run. Coverage is reported
+# out-of-band instead: the collector's reconcile loop counts the wired customer subscriptions and its
+# heartbeat carries that count, so the tenant turns Connected once it is above 0.
 # The catastrophic cases ARE caught synchronously here: empty subscription enumeration, a failed role
 # grant, and role grants that never become readable all fail closed before remediation.
 #
@@ -509,5 +510,5 @@ if [[ -n "$failed" ]]; then
 fi
 
 echo ""
-echo "ARMO CDR: tenant onboarding submitted. Activity-Log fan-in completes asynchronously"
-echo "(~10-15 minutes) — you do not need to keep this shell open."
+echo "ARMO CDR: tenant onboarding submitted. Activity-Log fan-in completes asynchronously; the tenant"
+echo "usually turns Connected within about 35 minutes — you do not need to keep this shell open."
