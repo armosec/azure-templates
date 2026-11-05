@@ -434,6 +434,20 @@ fi
 # per-subscription wiring is confirmed out-of-band (nothing is observable in-band for ~13 min).
 echo "== Kicking off remediation across in-scope subscriptions =="
 failed=""
+# Prints the subscription's remediation state when one is running (any state other than the terminal
+# Succeeded / Failed / Canceled, or none) and returns 0; returns 1 otherwise. Mirrors the reconcile loop's
+# own in-progress check (wire, in pkg/reconcile). Best-effort read: a missing remediation (or one we
+# can't read) counts as not running.
+remediation_running() { # $1 = subscription
+  local state
+  state="$(az policy remediation show --name "$REMEDIATION_NAME" --subscription "$1" \
+    --query provisioningState -o tsv 2>/dev/null || true)"
+  # Case-insensitive by enumeration rather than ${var,,}, which needs bash 4.
+  case "$state" in
+    ""|[Ss]ucceeded|[Ff]ailed|[Cc]anceled|[Cc]ancelled) return 1 ;;
+    *) echo "$state" ;;
+  esac
+}
 for sub in $SUBS; do
   # Skip a subscription whose remediation is already running. The collector's reconcile loop gets its
   # read access in step 4c — before this loop reaches every subscription — and polls every couple of
@@ -441,18 +455,10 @@ for sub in $SUBS; do
   # name, first; a re-run while remediations are still in flight hits the same case. Clearing that
   # remediation's PolicyDeployment_* record below and re-creating it would at best disturb a remediation
   # that is already wiring the subscription, and at worst fail the create and report the onboard
-  # INCOMPLETE though the wiring is proceeding. Mirrors the loop's own in-progress check (wire, in
-  # pkg/reconcile): any state other than the terminal Succeeded / Failed / Canceled (or none) is
-  # running. Best-effort read: a missing remediation (or one we can't read) leaves the state empty and
-  # falls through to the normal path below. Guarded from --dry-run (live read).
-  if [[ "$DRY_RUN" != "true" ]]; then
-    rem_state="$(az policy remediation show --name "$REMEDIATION_NAME" --subscription "$sub" \
-      --query provisioningState -o tsv 2>/dev/null || true)"
-    # Case-insensitive by enumeration rather than ${var,,}, which needs bash 4 (macOS ships 3.2).
-    case "$rem_state" in
-      ""|[Ss]ucceeded|[Ff]ailed|[Cc]anceled|[Cc]ancelled) ;;
-      *) echo "  ${sub}: remediation already in progress (${rem_state}) — skipping"; continue ;;
-    esac
+  # INCOMPLETE though the wiring is proceeding. Guarded from --dry-run (live read).
+  if [[ "$DRY_RUN" != "true" ]] && rem_state="$(remediation_running "$sub")"; then
+    echo "  ${sub}: remediation already in progress (${rem_state}) — skipping"
+    continue
   fi
   # Self-heal a re-onboard. Azure Policy names each remediation deployment deterministically from the
   # (fixed) policy name + subscription, so a previous onboarding of this tenant leaves a same-named
@@ -468,6 +474,11 @@ for sub in $SUBS; do
   # just the same — so this also heals the re-run-after-partial-failure case. Matching on our own
   # parameter value never touches an unrelated policy's PolicyDeployment; deleting a history record
   # affects no live resource.
+  #
+  # This cannot delete the deployment of a remediation the reconcile loop started concurrently: a
+  # ReEvaluateCompliance remediation writes its PolicyDeployment_* only after a compliance scan, 13 to 23
+  # minutes after it starts (26 live runs), while the in-progress check above ran seconds before this
+  # list. A remediation old enough to have written its record would have been skipped there.
   #
   # Fail CLOSED on a read we can't complete: an empty result (exit 0) means "no leftover records" and is
   # fine, but a non-zero `list` (throttling / missing read access) means we can't prove the sub is clean,
@@ -493,9 +504,18 @@ for sub in $SUBS; do
   fi
   # Suppress only stdout (the success JSON); keep stderr so a per-subscription failure's az error is
   # visible next to the summary warning, not hidden.
-  run az policy remediation create --name "$REMEDIATION_NAME" --subscription "$sub" \
-    --policy-assignment "$ASSIGNMENT_ID" --resource-discovery-mode ReEvaluateCompliance >/dev/null \
-    || failed="$failed $sub"
+  if ! run az policy remediation create --name "$REMEDIATION_NAME" --subscription "$sub" \
+      --policy-assignment "$ASSIGNMENT_ID" --resource-discovery-mode ReEvaluateCompliance >/dev/null; then
+    # The check at the top of this loop is not atomic with this create: the reconcile loop can start the
+    # same-named remediation in between, and Azure then rejects ours ("may not be changed or replaced
+    # while it is active"). Seen on a live run, 6 s apart. A remediation running now is the one we
+    # wanted, so only count the subscription as failed when none is.
+    if rem_state="$(remediation_running "$sub")"; then
+      echo "  ${sub}: remediation started concurrently (${rem_state}) — continuing"
+    else
+      failed="$failed $sub"
+    fi
+  fi
 done
 # Honest exit code: if any subscription could not be healed or have remediation started, this run is
 # INCOMPLETE — exit non-zero so a caller keying off the exit status (and the operator) knows to re-run,
